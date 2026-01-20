@@ -38,10 +38,6 @@ MEMORY_DETECT_OBJECTS = [
     "tv",
     "toilet",
 ]
-DOOR_CLASSES = ["door", "doorway", "entrance", "gate", "exit"]
-EXPLORATION_ANCHOR_THRESHOLD = 10
-LOOP_ANGLE_WINDOW = 3
-LOOP_PLACE_WINDOW = 3
 
 def write_metrics(metrics, path="objnav_hm3d.csv"):
     with open(path, mode="w", newline="") as csv_file:
@@ -128,68 +124,6 @@ def draw_detections_on_frame(frame, det, class_names, color=(0, 255, 0)):
         cv2.putText(out, text, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
     return out
 
-def find_door_direction(pano_images, detect_model, box_threshold=0.1, text_threshold=0.15):
-    best_idx = None
-    best_conf = -1.0
-    for idx, image in enumerate(pano_images):
-        try:
-            det = openset_detection(
-                cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
-                DOOR_CLASSES,
-                detect_model,
-                box_threshold=box_threshold,
-                text_threshold=text_threshold,
-            )
-        except Exception:
-            continue
-        if det.confidence is None or len(det.confidence) == 0:
-            continue
-        conf = float(np.max(det.confidence))
-        if conf > best_conf:
-            best_conf = conf
-            best_idx = idx
-    return best_idx
-
-def is_looping(recent_angle_idx, recent_place_ids):
-    if len(recent_angle_idx) >= LOOP_ANGLE_WINDOW:
-        a, b, c = recent_angle_idx[-3:]
-        if a == c and a != b:
-            return True
-        if a == b == c:
-            return True
-    if len(recent_place_ids) >= LOOP_PLACE_WINDOW and len(recent_angle_idx) >= LOOP_ANGLE_WINDOW:
-        if recent_place_ids[-1] == recent_place_ids[-2] == recent_place_ids[-3]:
-            if len(set(recent_angle_idx[-3:])) <= 2:
-                return True
-    return False
-
-def should_force_frontier(place_manager, recent_angle_idx, recent_place_ids):
-    if is_looping(recent_angle_idx, recent_place_ids):
-        return True
-    if len(recent_place_ids) >= 3 and len(set(recent_place_ids[-3:])) == 1:
-        return True
-    if place_manager.current_place is None:
-        return False
-    return len(place_manager.current_place.anchors) >= EXPLORATION_ANCHOR_THRESHOLD
-
-def select_forced_direction(place_manager, pano_images, detect_model, recent_angle_idx, recent_place_ids):
-    if not should_force_frontier(place_manager, recent_angle_idx, recent_place_ids):
-        return None, None, None
-    door_idx = find_door_direction(pano_images, detect_model)
-    if door_idx is not None:
-        return door_idx, "door", "door"
-
-    num_angles = len(pano_images)
-    if num_angles == 0:
-        return None, None, None
-    counts = {idx: recent_angle_idx.count(idx) for idx in range(num_angles)}
-    candidates = sorted(range(num_angles), key=lambda i: (counts.get(i, 0), i))
-    recent_block = set(recent_angle_idx[-2:])
-    for idx in candidates:
-        if idx not in recent_block:
-            return idx, "frontier", None
-    return candidates[0], "frontier", None
-
 args = get_args()
 habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
 print("scene_dataset =", habitat_config.habitat.simulator.scene_dataset)
@@ -231,8 +165,6 @@ for i in tqdm(range(args.eval_episodes)):
     obs = habitat_env.reset()
     place_manager = PlaceManager()
     stm_visualizer = GraphVisualizer()
-    recent_angle_idx = []
-    recent_place_ids = []
 
     # 시작 지오데식 거리(최단경로 기준)
     start_geodesic_m = float(habitat_env.get_metrics()['distance_to_goal'])
@@ -285,27 +217,12 @@ for i in tqdm(range(args.eval_episodes)):
     mem_det = update_place_memory(place_manager, habitat_env.sim, semantic_extractor, episode_images_raw[-1], detection_model)
     if mem_det is not None:
         episode_video[-1] = draw_detections_on_frame(episode_video[-1], mem_det, MEMORY_DETECT_OBJECTS, color=(0, 200, 255))
-    if place_manager.current_place is not None:
-        recent_place_ids.append(place_manager.current_place.place_id)
     nav_context = place_manager.get_nav_context()
-    forced_idx, forced_reason, forced_label = select_forced_direction(
-        place_manager, episode_images_raw[-12:], detection_model, recent_angle_idx, recent_place_ids
-    )
     goal_image, goal_mask, debug_image, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
         episode_images_raw[-12:],
         context=nav_context,
-        forced_direction_idx=forced_idx,
-        forced_reason=forced_reason,
-        forced_target_label=forced_label,
-        forced_box_threshold=0.1,
-        forced_text_threshold=0.15,
     )
     append_debug_frame(debug_image)
-    recent_angle_idx.append(goal_rotate)
-    if len(recent_angle_idx) > 30:
-        recent_angle_idx = recent_angle_idx[-30:]
-    if len(recent_place_ids) > 30:
-        recent_place_ids = recent_place_ids[-30:]
     for j in range(min(11 - goal_rotate, 1 + goal_rotate)):
         if goal_rotate <= 6:
             obs = habitat_env.step(3)
@@ -346,27 +263,12 @@ for i in tqdm(range(args.eval_episodes)):
             mem_det = update_place_memory(place_manager, habitat_env.sim, semantic_extractor, episode_images_raw[-1], detection_model)
             if mem_det is not None:
                 episode_video[-1] = draw_detections_on_frame(episode_video[-1], mem_det, MEMORY_DETECT_OBJECTS, color=(0, 200, 255))
-            if place_manager.current_place is not None:
-                recent_place_ids.append(place_manager.current_place.place_id)
             nav_context = place_manager.get_nav_context()
-            forced_idx, forced_reason, forced_label = select_forced_direction(
-                place_manager, episode_images_raw[-12:], detection_model, recent_angle_idx, recent_place_ids
-            )
             goal_image, goal_mask, debug_image, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
                 episode_images_raw[-12:],
                 context=nav_context,
-                forced_direction_idx=forced_idx,
-                forced_reason=forced_reason,
-                forced_target_label=forced_label,
-                forced_box_threshold=0.1,
-                forced_text_threshold=0.15,
             )
             append_debug_frame(debug_image)
-            recent_angle_idx.append(goal_rotate)
-            if len(recent_angle_idx) > 30:
-                recent_angle_idx = recent_angle_idx[-30:]
-            if len(recent_place_ids) > 30:
-                recent_place_ids = recent_place_ids[-30:]
             for j in range(min(11 - goal_rotate, goal_rotate + 1)):
                 if habitat_env.episode_over:
                     break

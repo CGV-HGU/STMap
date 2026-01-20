@@ -72,42 +72,27 @@ class GPT4V_Planner:
         self,
         pano_images,
         context=None,
-        forced_direction_idx=None,
-        forced_reason=None,
-        forced_target_label=None,
-        forced_box_threshold=0.2,
-        forced_text_threshold=0.4,
     ):
-        used_forced = forced_direction_idx is not None
-        if used_forced:
-            direction = int(forced_direction_idx) % max(1, len(pano_images))
-            goal_flag = True
-            scene_desc = forced_reason or "forced"
-            self.action_history.append((direction * 30, scene_desc))
-        else:
-            direction,goal_flag,scene_desc = self.query_gpt4v(pano_images,context=context)
+        direction, llm_goal_flag, scene_desc = self.query_gpt4v(pano_images, context=context)
         direction_image = pano_images[direction]
         debug_image = np.array(direction_image)
-        if forced_target_label:
-            bbox = openset_detection(
-                cv2.cvtColor(direction_image, cv2.COLOR_BGR2RGB),
-                [forced_target_label],
-                self.dino_model,
-                box_threshold=forced_box_threshold,
-                text_threshold=forced_text_threshold,
-            )
-            debug_image = self._draw_detections(debug_image, bbox, [forced_target_label], color=(0, 255, 255))
+        target_bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),self.detect_objects,self.dino_model)
+        debug_image = self._draw_detections(debug_image, target_bbox, self.detect_objects, color=(0, 255, 0))
+        target_visible = False
+        try:
+            target_idx = self.detect_objects.index(self.object_goal)
+            target_visible = target_idx in target_bbox.class_id
+        except ValueError:
+            target_visible = False
+        goal_flag = bool(llm_goal_flag)
+        if goal_flag and not target_visible:
+            goal_flag = False
+        if goal_flag:
+            bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),[self.object_goal],self.dino_model)
+            debug_image = self._draw_detections(debug_image, bbox, [self.object_goal], color=(255, 0, 0))
         else:
-            target_bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),self.detect_objects,self.dino_model)
-            debug_image = self._draw_detections(debug_image, target_bbox, self.detect_objects, color=(0, 255, 0))
-            if self.detect_objects.index(self.object_goal) not in target_bbox.class_id:
-                goal_flag = False
-            if goal_flag:
-                bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),[self.object_goal],self.dino_model)
-                debug_image = self._draw_detections(debug_image, bbox, [self.object_goal], color=(255, 0, 0))
-            else:
-                bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),['floor'],self.dino_model)
-                debug_image = self._draw_detections(debug_image, bbox, ['floor'], color=(200, 200, 200))
+            bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),['floor'],self.dino_model)
+            debug_image = self._draw_detections(debug_image, bbox, ['floor'], color=(200, 200, 200))
         try:
             mask = sam_masking(direction_image,bbox.xyxy,self.sam_model)
         except:
@@ -192,13 +177,6 @@ class GPT4V_Planner:
 
             chosen_angle = int(answer['Angle'])
             goal_flag = bool(answer.get('Flag', False))
-            if not goal_flag and len(self.action_history) >= 2:
-                last_angle = self.action_history[-1][0]
-                prev_angle = self.action_history[-2][0]
-                if chosen_angle == prev_angle and chosen_angle != last_angle:
-                    candidates = [int(a) for a in angles if int(a) not in (chosen_angle, last_angle)]
-                    if candidates:
-                        chosen_angle = int(np.random.choice(candidates))
 
             self.action_history.append((chosen_angle, scene_desc))
             idx = (int(chosen_angle // 30)) % max(1, len(pano_images))
