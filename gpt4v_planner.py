@@ -107,12 +107,25 @@ class GPT4V_Planner:
         self.direction_mask_trajectory.append(mask)
 
         debug_mask = np.zeros_like(debug_image)
-        pixel_y,pixel_x = np.where(mask>0)[0:2]
-        pixel_y = int(pixel_y.mean())
-        pixel_x = int(pixel_x.mean())
+        ys, xs = np.where(mask > 0)[0:2]
+        if len(xs) == 0:
+            h, w = debug_image.shape[:2]
+            pixel_x, pixel_y = w // 2, h // 2
+        else:
+            pixel_y = int(ys.mean())
+            pixel_x = int(xs.mean())
         debug_image = cv2.rectangle(debug_image,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,0,0),-1)
         debug_mask = cv2.rectangle(debug_mask,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,255,255),-1)
         debug_mask = debug_mask.mean(axis=-1)
+        if vis_rgb is not None:
+            cv2.drawMarker(
+                vis_rgb,
+                (pixel_x, pixel_y),
+                (0, 255, 0),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=16,
+                thickness=2,
+            )
         self.last_vis_rgb = vis_rgb
         return direction_image,debug_mask,debug_image,vis_rgb,direction,goal_flag,scene_desc
 
@@ -123,6 +136,7 @@ class GPT4V_Planner:
 
         cv2.imwrite("monitor-panoramic.jpg", inference_image)
         text_content = "<Target Object>:{}\n".format(self.object_goal)
+        # NOTE: PixelNav original input uses only the target object.
         if context:
             text_content += "<Memory Context>:\n{}\n".format(context)
         if self.action_history:
