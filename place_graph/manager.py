@@ -1,4 +1,5 @@
 import math
+import re
 import time
 from collections import deque, Counter
 from .data import Place, Anchor
@@ -32,6 +33,7 @@ class PlaceManager:
         self.CORRIDOR_SPACING = 2.0
         self.ROOM_SPACING = 1.5
         self.CORNER_THRESHOLD = math.radians(30) # 30 degrees
+        self.ANCHOR_STEP_THRESHOLD = 2
         
         # Visualization Helpers
         self.edges = [] # List of explicit edges [(id1, id2), ...] for viz
@@ -40,24 +42,33 @@ class PlaceManager:
         self.reid = PlaceReIdentifier()
         
         self.last_door_time = 0
+
+        # Action-based anchor counters
+        self.steps_since_anchor = 0
+        self.forward_steps_since_anchor = 0
+        self.turn_since_anchor = False
+        self.forward_after_turn = False
         
-        # Dwell Time Policy (Phase 6)
+        # Dwell Step Policy (Phase 6)
         self.pending_scene_type = None
         self.pending_caption = None
-        self.pending_start_time = 0
-        self.DWELL_TIME_THRESHOLD = 3.0  # seconds
+        self.pending_scene_steps = 0
+        self.DWELL_STEP_THRESHOLD = 3  # steps
 
-    def _check_l2_transition(self, context, caption=""):
+    def _check_l2_transition(self, context, caption="", scene_update=True):
         """
         Decides if we need to switch the Active Place (L2).
         Logic: 
         1. Corridor <-> Room (Classic)
         2. Room A -> Room B (Door Gated)
-        3. Dwell Time Verification (New!)
+        3. Dwell Step Verification (New!)
         """
+        if not scene_update:
+            return
         if context == "unknown": 
             # Reset pending if VLM loses track
             self.pending_scene_type = None
+            self.pending_scene_steps = 0
             return
         
         current_type = self.current_place.place_type
@@ -66,48 +77,33 @@ class PlaceManager:
         if context == current_type:
             # Same type - reset any pending transition
             self.pending_scene_type = None
+            self.pending_scene_steps = 0
             return
         
-        # Dwell Time Check: Has this new scene type been stable long enough?
-        current_time = time.time()
-        
+        # Dwell Step Check: Has this new scene type been stable long enough?
         if self.pending_scene_type != context:
-            # New scene type detected - start pending timer
+            # New scene type detected - start pending counter
             self.pending_scene_type = context
             self.pending_caption = caption
-            self.pending_start_time = current_time
+            self.pending_scene_steps = 1
             Logger.info("Manager", f"Pending transition detected: {current_type} -> {context} (waiting...)")
             return
-        
-        # Same pending type - check if enough time has passed
-        dwell_time = current_time - self.pending_start_time
-        
-        # Phase 9A: Adaptive Dwell Time based on VLM stability
-        # Calculate how stable the VLM buffer is
-        required_dwell_time = self.DWELL_TIME_THRESHOLD  # Default 3.0s
-        
-        if len(self.vlm_buffer) >= 3:
-            counts = Counter(self.vlm_buffer)
-            most_common_count = counts.most_common(1)[0][1]
-            buffer_size = len(self.vlm_buffer)
-            stability_ratio = most_common_count / buffer_size
-            
-            # Adjust dwell time based on stability
-            if stability_ratio >= 0.9:  # Very stable (90%+ same)
-                required_dwell_time = 1.5  # Fast response
-            elif stability_ratio >= 0.7:  # Stable (70%+)
-                required_dwell_time = 2.0  # Medium
-            # else: use default 3.0s (unstable)
-        
-        if dwell_time < required_dwell_time:
-            # Still pending, not enough time
+
+        # Same pending type - check if enough steps have passed
+        self.pending_scene_steps += 1
+        if self.pending_scene_steps < self.DWELL_STEP_THRESHOLD:
+            # Still pending, not enough steps
             return
-        
-        # Dwell time satisfied! Now check other conditions
-        Logger.info("Manager", f"Dwell time satisfied ({dwell_time:.1f}s / {required_dwell_time:.1f}s required). Evaluating transition conditions...")
-        
+
+        # Dwell steps satisfied! Now check other conditions
+        Logger.info(
+            "Manager",
+            f"Dwell steps satisfied ({self.pending_scene_steps} / {self.DWELL_STEP_THRESHOLD} steps). Evaluating transition conditions...",
+        )
+
         # Reset pending state
         self.pending_scene_type = None
+        self.pending_scene_steps = 0
 
         # Condition 1: Corridor Transition
         is_corridor_now = "corridor" in current_type
@@ -177,9 +173,9 @@ class PlaceManager:
                 self.current_place = matched_place
                 
                 # Merge attributes
-                if caption and not matched_place.caption:
-                    matched_place.caption = caption
-                    Logger.graph("Update", f"Updated caption for {matched_place_id}")
+                if caption and not matched_place.semantic_description:
+                    matched_place.semantic_description = caption
+                    Logger.graph("Update", f"Updated description for {matched_place_id}")
                 
                 # Create new Anchor in the matched Place
                 self._create_anchor(matched_place_id, self.robot_pose)
@@ -188,7 +184,7 @@ class PlaceManager:
                 # No match - create new Place (original behavior)
                 new_pid = self._create_place(context)
                 if caption: 
-                    self.places[new_pid].caption = caption
+                    self.places[new_pid].semantic_description = caption
                 self._create_anchor(new_pid, self.robot_pose)
 
     def get_current_pose(self):
@@ -198,10 +194,10 @@ class PlaceManager:
         if not raw_context: return self.stable_vlm_context
         # Normalize
         norm_ctx = raw_context.lower().strip()
-        # Remove trailing period
-        if norm_ctx.endswith('.'): norm_ctx = norm_ctx[:-1]
-        
-        if "hallway" in norm_ctx: norm_ctx = norm_ctx.replace("hallway", "corridor")
+        norm_ctx = re.sub(r"[^a-z0-9_ ]+", "", norm_ctx)
+        norm_ctx = re.sub(r"\s+", " ", norm_ctx).strip()
+        if "hallway" in norm_ctx:
+            norm_ctx = norm_ctx.replace("hallway", "corridor")
         
         self.vlm_buffer.append(norm_ctx)
         if len(self.vlm_buffer) < 3: return norm_ctx
@@ -211,13 +207,34 @@ class PlaceManager:
         if count >= 3: return most_common
         return self.stable_vlm_context
 
-    def update(self, current_pose, vlm_data, detected_objects):
+    def _reset_anchor_counters(self):
+        self.steps_since_anchor = 0
+        self.forward_steps_since_anchor = 0
+        self.turn_since_anchor = False
+        self.forward_after_turn = False
+
+    def _update_action_state(self, action):
+        if self.current_anchor is None or action is None:
+            return
+        if action == "forward":
+            self.steps_since_anchor += 1
+            self.forward_steps_since_anchor += 1
+            if self.turn_since_anchor:
+                self.forward_after_turn = True
+            return
+        if action in ("turn_left", "turn_right"):
+            self.steps_since_anchor += 1
+            self.turn_since_anchor = True
+            return
+
+    def update(self, current_pose, vlm_data, detected_objects, action=None):
         """
         Main Control Loop (30Hz approx)
         Args:
             current_pose: (x, y, yaw)
             vlm_data: Dict or None from VLM {"scene_type":..., "description":...}
             detected_objects: List of dicts from YOLO
+            action: Optional action string ("forward", "turn_left", "turn_right", "stop")
         """
         # 1. Update State
         self.robot_pose = current_pose
@@ -255,18 +272,22 @@ class PlaceManager:
             self.stable_vlm_context = current_scene_type
             return
 
-        # 4. Detect Place Transition (L2 Logic)
-        self._check_l2_transition(current_scene_type, current_caption)
+        # 4. Update Action State (L1 Logic)
+        self._update_action_state(action)
+
+        # 5. Detect Place Transition (L2 Logic)
+        if vlm_data:
+            self._check_l2_transition(current_scene_type, current_caption, scene_update=True)
         
-        # 5. Check Anchor Creation (L1 Logic: Topology)
+        # 6. Check Anchor Creation (L1 Logic: Topology)
         self._check_l1_topology(detected_objects)
         
-        # 6. Semantic Update (L2 Attributes)
+        # 7. Semantic Update (L2 Attributes)
         if self.current_place:
              # Update Caption if available and empty
-             if current_caption and not self.current_place.caption:
-                 self.current_place.caption = current_caption
-                 Logger.graph("Update", f"Place {self.current_place.place_id} caption set: '{current_caption}'")
+             if current_caption and not self.current_place.semantic_description:
+                 self.current_place.semantic_description = current_caption
+                 Logger.graph("Update", f"Place {self.current_place.place_id} description set: '{current_caption}'")
                  
              if detected_objects:
                 for obj in detected_objects:
@@ -289,43 +310,29 @@ class PlaceManager:
     def _check_l1_topology(self, detected_objects=None):
         """
         Decides if we need to drop a new Anchor (L1).
-        Criteria: Distance OR Curvature OR Door Presence (Policy)
+        Criteria: Forward Steps OR Turn+Forward OR Door Presence (Policy)
         """
-        last_pose = self.current_anchor.pose
-        dist = math.sqrt((self.robot_pose[0]-last_pose[0])**2 + (self.robot_pose[1]-last_pose[1])**2)
-        
-        # Curvature check
-        angle_diff = abs(self.robot_pose[2] - last_pose[2])
-        # Normalize angle
-        angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi
-        angle_diff = abs(angle_diff)
-        
-        # Thresholds
-        is_corridor = "corridor" in self.current_place.place_type
-        spacing = self.CORRIDOR_SPACING if is_corridor else self.ROOM_SPACING
-        
         should_create = False
-        
-        # 1. Distance Trigger
-        if dist > spacing:
+
+        # 1. Forward Step Trigger
+        if self.forward_steps_since_anchor >= self.ANCHOR_STEP_THRESHOLD:
             should_create = True
-            
-        # 2. Curvature Trigger
-        if dist > 0.5 and angle_diff > self.CORNER_THRESHOLD:
-            Logger.info("Manager", f"Corner Detected ({math.degrees(angle_diff):.0f} deg). Creating Anchor.")
+
+        # 2. Turn + Forward Trigger
+        if self.turn_since_anchor and self.forward_after_turn:
+            Logger.info("Manager", "Turn + Forward detected. Creating Anchor.")
             should_create = True
-            
+
         # 3. Door Trigger (Policy)
         # If we see a door nearby, ensure we have an anchor
-        # Reduced cooldown from 0.8m to 0.5m for better responsiveness
         door_labels = [
             'door', 'doorway', 'entrance', 'gate', 'exit',
             'open door', 'closed door', 'door frame', 'sliding door'
         ]
-        
-        if detected_objects and dist > 0.2: 
+        is_door_creation = False
+        if detected_objects and self.forward_steps_since_anchor > 0:
             has_door = any(obj['label'] in door_labels for obj in detected_objects)
-            
+
             # Spatial Suppression: Don't create multiple door anchors for the same door
             if has_door:
                 # Check distance to other DOOR anchors in this place
@@ -339,30 +346,13 @@ class PlaceManager:
                         if d_to_door < 1.0:  # 1.0m suppression radius (relaxed)
                             is_duplicate = True
                             break
-                
-                if not is_duplicate:
-                    Logger.info("Manager", f"Door Detected. Forcing Anchor.")
-                    should_create = True
-            
-        if should_create:
-            # Check if this creation was due to a Door Trigger (policy 3)
-            # Re-evaluate the trigger conditions to pass correct flag
-            is_door_creation = False
-            if detected_objects and dist > 0.2:
-                 if any(obj['label'] in door_labels for obj in detected_objects):
-                     # apply same suppression check
-                     is_duplicate = False
-                     for aid in self.current_place.anchors:
-                        if aid not in self.anchors: continue
-                        a = self.anchors[aid]
-                        if getattr(a, 'is_door', False):
-                            d_to_door = math.sqrt((self.robot_pose[0]-a.pose[0])**2 + (self.robot_pose[1]-a.pose[1])**2)
-                            if d_to_door < 1.0:
-                                is_duplicate = True
-                                break
-                     if not is_duplicate:
-                        is_door_creation = True
 
+                if not is_duplicate:
+                    Logger.info("Manager", "Door Detected. Forcing Anchor.")
+                    should_create = True
+                    is_door_creation = True
+
+        if should_create:
             self._create_anchor(self.current_place.place_id, self.robot_pose, is_door=is_door_creation)
 
     def _create_place(self, place_type):
@@ -395,6 +385,8 @@ class PlaceManager:
         
         self.anchors[aid] = new_anchor
         self.current_anchor = new_anchor
+
+        self._reset_anchor_counters()
         
         # Debug
         Logger.graph("Anchor", f"+Anchor {aid} in {place_id}")
@@ -457,12 +449,12 @@ class PlaceManager:
         
         # 2. Description (Caption)
         desc_info = ""
-        if self.current_place.caption:
-            desc_info = f"Description: {self.current_place.caption}"
+        if self.current_place.semantic_description:
+            desc_info = f"Description: {self.current_place.semantic_description}"
             
         # 3. Object Context
         obj_info = ""
-        objs = list(self.current_place.object_signature.keys())
+        objs = sorted(self.current_place.objects_list)
         if objs:
             # Sort by count or just list top 5
             top_objs = objs[:10] 
@@ -542,7 +534,7 @@ class PlaceManager:
         for pid, p in self.places.items():
             data["places"][pid] = {
                 "type": p.place_type,
-                "objects": list(p.object_signature.keys()),
+                "objects": list(p.objects_list),
                 "anchor_count": len(p.anchors)
             }
         for aid, a in self.anchors.items():

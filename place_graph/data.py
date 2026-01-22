@@ -11,8 +11,8 @@ class Place:
         self.place_type = place_type
         
         # Semantic Attributes
-        self.caption = ""  # VLM Description
-        self.object_signature = {} # {label: count} - Used for context, not mapping
+        self.semantic_description = ""  # VLM Description
+        self.objects_list = set()  # {label} - Used for context, not mapping
         
         # Topology Links
         self.anchors = [] # List of Anchor IDs that belong to this Place
@@ -27,18 +27,30 @@ class Place:
         Add an object to the semantic signature.
         We don't care about position, just presence.
         """
-        self.object_signature[label] = self.object_signature.get(label, 0) + 1
+        self.objects_list.add(label)
         self._cached_object_set = None  # Invalidate cache
     
     @property
     def object_set(self):
         """Cached object set for fast Re-ID comparison."""
         if self._cached_object_set is None:
-            self._cached_object_set = set(self.object_signature.keys())
+            self._cached_object_set = set(self.objects_list)
         return self._cached_object_set
 
+    @property
+    def caption(self):
+        return self.semantic_description
+
+    @caption.setter
+    def caption(self, value):
+        self.semantic_description = value or ""
+
+    @property
+    def object_signature(self):
+        return {label: 1 for label in self.objects_list}
+
     def __repr__(self):
-        return f"<Place {self.place_id}: {self.place_type} ({len(self.object_signature)} objs)>"
+        return f"<Place {self.place_id}: {self.place_type} ({len(self.objects_list)} objs)>"
 
 
 class Anchor:

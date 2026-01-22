@@ -13,6 +13,7 @@ class GPT4V_Planner:
         self.dino_model = dino_model
         self.sam_model = sam_model
         self.detect_objects = ['bed','sofa','chair','plant','tv','toilet','floor']
+        self.last_vis_rgb = None
         # ---- LLM/플래너/모듈별 시간 계측 저장소 ----
         self.llm_call_count = 0
         self.llm_durations = []          # 각 LLM 호출 소요시간(초)
@@ -77,10 +78,14 @@ class GPT4V_Planner:
         direction_image = pano_images[direction]
         debug_image = np.array(direction_image)
         target_bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),self.detect_objects,self.dino_model)
-        debug_image = self._draw_detections(debug_image, target_bbox, self.detect_objects, color=(0, 255, 0))
-        target_visible = False
         try:
             target_idx = self.detect_objects.index(self.object_goal)
+        except ValueError:
+            target_idx = -1
+        vis_bgr = draw_detections_bgr(direction_image, target_bbox, goal_idx=target_idx)
+        vis_rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+        target_visible = False
+        try:
             target_visible = target_idx in target_bbox.class_id
         except ValueError:
             target_visible = False
@@ -108,7 +113,8 @@ class GPT4V_Planner:
         debug_image = cv2.rectangle(debug_image,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,0,0),-1)
         debug_mask = cv2.rectangle(debug_mask,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,255,255),-1)
         debug_mask = debug_mask.mean(axis=-1)
-        return direction_image,debug_mask,debug_image,direction,goal_flag,scene_desc
+        self.last_vis_rgb = vis_rgb
+        return direction_image,debug_mask,debug_image,vis_rgb,direction,goal_flag,scene_desc
 
 
     def query_gpt4v(self, pano_images, context=None):

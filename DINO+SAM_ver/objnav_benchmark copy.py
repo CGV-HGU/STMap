@@ -77,7 +77,7 @@ for i in tqdm(range(args.eval_episodes)):
         obs = habitat_env.step(3)
         episode_images.append(obs['rgb'])
         episode_topdowns.append(adjust_topdown(habitat_env.get_metrics()))
-    goal_image,goal_mask,debug_image,goal_rotate,goal_flag,_ = nav_planner.make_plan(episode_images[-12:])    
+    goal_image,goal_mask,debug_image,vis_rgb,goal_rotate,goal_flag,_ = nav_planner.make_plan(episode_images[-12:])    
     for j in range(min(11-goal_rotate,1+goal_rotate)):
         if goal_rotate <= 6:
             obs = habitat_env.step(3)
@@ -125,7 +125,7 @@ for i in tqdm(range(args.eval_episodes)):
                 obs = habitat_env.step(3)
                 episode_images.append(obs['rgb'])
                 episode_topdowns.append(adjust_topdown(habitat_env.get_metrics()))
-            goal_image,goal_mask,debug_image,goal_rotate,goal_flag,_ = nav_planner.make_plan(episode_images[-12:])
+            goal_image,goal_mask,debug_image,vis_rgb,goal_rotate,goal_flag,_ = nav_planner.make_plan(episode_images[-12:])
             for j in range(min(11-goal_rotate,goal_rotate+1)):
                 if habitat_env.episode_over:
                     break

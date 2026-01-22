@@ -39,6 +39,26 @@ MEMORY_DETECT_OBJECTS = [
     "toilet",
 ]
 
+ACTION_STOP = 0
+ACTION_FORWARD = 1
+ACTION_TURN_LEFT = 2
+ACTION_TURN_RIGHT = 3
+ACTION_LOOK_UP = 4
+ACTION_LOOK_DOWN = 5
+
+VLM_UPDATE_INTERVAL = 20
+
+def action_to_nav(action_id):
+    if action_id == ACTION_FORWARD:
+        return "forward"
+    if action_id == ACTION_TURN_LEFT:
+        return "turn_left"
+    if action_id == ACTION_TURN_RIGHT:
+        return "turn_right"
+    if action_id == ACTION_STOP:
+        return "stop"
+    return None
+
 def write_metrics(metrics, path="objnav_hm3d.csv"):
     with open(path, mode="w", newline="") as csv_file:
         fieldnames = metrics[0].keys()
@@ -96,17 +116,35 @@ def get_agent_pose(sim):
     yaw = -np.arctan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y ** 2 + q.z ** 2))
     return (float(pos[0]), float(pos[2]), float(yaw))
 
-def update_place_memory(place_manager, sim, semantic_extractor, obs_image, detect_model):
+def update_place_memory(
+    place_manager,
+    sim,
+    semantic_extractor,
+    obs_image,
+    detect_model,
+    action=None,
+    step_count=None,
+    vlm_interval=VLM_UPDATE_INTERVAL,
+    force_vlm=False,
+):
     vlm_data = None
-    if semantic_extractor is not None:
+    det = None
+    detected_objects = []
+
+    do_vlm = force_vlm or (step_count is not None and step_count % vlm_interval == 0)
+
+    if do_vlm and semantic_extractor is not None:
         try:
             _, buf = cv2.imencode(".jpg", obs_image[:, :, ::-1])
             vlm_data = semantic_extractor.analyze_scene(buf.tobytes())
         except Exception:
             vlm_data = None
-    detected_objects, det = detect_memory_objects(obs_image, detect_model, return_det=True)
+
+    if do_vlm and detect_model is not None:
+        detected_objects, det = detect_memory_objects(obs_image, detect_model, return_det=True)
+
     pose = get_agent_pose(sim)
-    place_manager.update(pose, vlm_data, detected_objects)
+    place_manager.update(pose, vlm_data, detected_objects, action=action)
     return det
 
 def draw_detections_on_frame(frame, det, class_names, color=(0, 255, 0)):
@@ -195,17 +233,39 @@ for i in tqdm(range(args.eval_episodes)):
     episode_video = []
     episode_topdowns = []
     episode_stm = []
-    def record_step(obs_):
+    action_step = [0]
+    def record_step(obs_, action=None, force_vlm=False):
+        if action is not None:
+            action_step[0] += 1
+        nav_action = action_to_nav(action) if action is not None else None
+        mem_det = update_place_memory(
+            place_manager,
+            habitat_env.sim,
+            semantic_extractor,
+            obs_['rgb'],
+            detection_model,
+            action=nav_action,
+            step_count=action_step[0],
+            vlm_interval=VLM_UPDATE_INTERVAL,
+            force_vlm=force_vlm,
+        )
         episode_images_raw.append(obs_['rgb'])
         episode_video.append(obs_['rgb'].copy())
         episode_topdowns.append(adjust_topdown(habitat_env.get_metrics()))
         episode_stm.append(stm_visualizer.draw_map(place_manager))
+        if mem_det is not None:
+            episode_video[-1] = draw_detections_on_frame(
+                episode_video[-1],
+                mem_det,
+                MEMORY_DETECT_OBJECTS,
+                color=(0, 200, 255),
+            )
     def append_debug_frame(frame, repeat=2):
         if frame is None:
             return
         for _ in range(repeat):
             episode_video.append(frame.copy())
-    record_step(obs)
+    record_step(obs, force_vlm=True)
 
     # 계산 시간(비디오 I/O 제외) 측정 시작
     episode_t0 = time.perf_counter()
@@ -213,22 +273,21 @@ for i in tqdm(range(args.eval_episodes)):
     # 한 바퀴 관측 후 초기 플랜
     for _ in range(11):
         obs = habitat_env.step(3)
-        record_step(obs)
-    mem_det = update_place_memory(place_manager, habitat_env.sim, semantic_extractor, episode_images_raw[-1], detection_model)
-    if mem_det is not None:
-        episode_video[-1] = draw_detections_on_frame(episode_video[-1], mem_det, MEMORY_DETECT_OBJECTS, color=(0, 200, 255))
+        record_step(obs, action=3)
     nav_context = place_manager.get_nav_context()
-    goal_image, goal_mask, debug_image, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
+    goal_image, goal_mask, debug_image, vis_rgb, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
         episode_images_raw[-12:],
         context=nav_context,
     )
-    append_debug_frame(debug_image)
     for j in range(min(11 - goal_rotate, 1 + goal_rotate)):
         if goal_rotate <= 6:
             obs = habitat_env.step(3)
+            action = 3
         else:
             obs = habitat_env.step(2)
-        record_step(obs)
+            action = 2
+        record_step(obs, action=action)
+    append_debug_frame(vis_rgb)
     nav_executor.reset(goal_image, goal_mask)
 
     while not habitat_env.episode_over:
@@ -239,7 +298,7 @@ for i in tqdm(range(args.eval_episodes)):
             elif action == 5:
                 heading_offset -= 1
             obs = habitat_env.step(action)
-            record_step(obs)
+            record_step(obs, action=action)
         else:
             if habitat_env.episode_over:
                 break
@@ -247,36 +306,37 @@ for i in tqdm(range(args.eval_episodes)):
                 if habitat_env.episode_over:
                     break
                 if heading_offset > 0:
-                    obs = habitat_env.step(5)
+                    action_id = 5
+                    obs = habitat_env.step(action_id)
                     heading_offset -= 1
                 elif heading_offset < 0:
-                    obs = habitat_env.step(4)
+                    action_id = 4
+                    obs = habitat_env.step(action_id)
                     heading_offset += 1
-                record_step(obs)
+                record_step(obs, action=action_id)
 
             # 다시 한 바퀴 관측 후 재플랜
             for _ in range(11):
                 if habitat_env.episode_over:
                     break
                 obs = habitat_env.step(3)
-                record_step(obs)
-            mem_det = update_place_memory(place_manager, habitat_env.sim, semantic_extractor, episode_images_raw[-1], detection_model)
-            if mem_det is not None:
-                episode_video[-1] = draw_detections_on_frame(episode_video[-1], mem_det, MEMORY_DETECT_OBJECTS, color=(0, 200, 255))
+                record_step(obs, action=3)
             nav_context = place_manager.get_nav_context()
-            goal_image, goal_mask, debug_image, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
+            goal_image, goal_mask, debug_image, vis_rgb, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
                 episode_images_raw[-12:],
                 context=nav_context,
             )
-            append_debug_frame(debug_image)
             for j in range(min(11 - goal_rotate, goal_rotate + 1)):
                 if habitat_env.episode_over:
                     break
                 if goal_rotate <= 6:
                     obs = habitat_env.step(3)
+                    action = 3
                 else:
                     obs = habitat_env.step(2)
-                record_step(obs)
+                    action = 2
+                record_step(obs, action=action)
+            append_debug_frame(vis_rgb)
             nav_executor.reset(goal_image, goal_mask)
 
     # 계산 시간 측정 종료

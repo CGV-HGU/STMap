@@ -25,7 +25,7 @@ class PlaceReIdentifier:
         THRESHOLD = 0.6
         
         cand_objs = candidate_place.object_set  # Use cached set
-        cand_caption = candidate_place.caption.lower()
+        cand_caption = candidate_place.semantic_description.lower()
         
         for place in candidates:
             # Skip self
@@ -33,7 +33,7 @@ class PlaceReIdentifier:
                 continue
             
             # A. Caption Similarity (Levenshtein)
-            place_caption = place.caption.lower()
+            place_caption = place.semantic_description.lower()
             caption_score = 0.0
             if cand_caption and place_caption:
                 caption_score = difflib.SequenceMatcher(None, cand_caption, place_caption).ratio()
