@@ -1,312 +1,794 @@
-# Requirements: PixelNav + VLM Planner + Navigation Context (Place–Anchor Memory)
+content = r"""'''md
+# Development Requirement Proposal (Canonical Spec)
+## Semantic Circular Memory + Door Experience for Metric‑Free Object Navigation (Single‑Episode)
 
-## 0. 문서 목적
-본 문서는 AI 코딩 에이전트가 구현 가능한 수준으로 시스템 요구사항을 명확히 정의한다.  
-목표는 PixelNav 기반의 저수준 주행 정책은 유지하면서, VLM Planner에 Navigation Context(공간 메모리)를 공급하여
-
-- 반복 주행(oscillation) 및 교착(deadlock)을 감소시키고
-- 이미 탐색한 공간의 재방문을 최소화하여
-- 장거리 주행 성능(SR, SPL)을 개선하는 것
-
-이다.
+> **Canonical decision**: **Single‑episode memory**. All memory resets at episode start.  
+> **Hard constraint**: **No metric units** (no meters, degrees, radians, global coordinates).  
+> **Core idea**: Navigate by **what is seen + remembered**, not by geometry.
 
 ---
 
-## 1. 범위(Scope)
+## 0) What we discussed / decided / lacked (from the conversation)
 
-### 1.1 포함(In-scope)
-- PixelNav 기반 Pixel-Guided Navigation Policy(저수준 정책) 연동
-- Planner VLM(**gemini-2.5-flash-lite**, Vertex AI) 기반 상위 의사결정
-- Scene 분석용 VLM(Vertex Endpoint 기반)로 place_type(scene_type) 추정
-- Place–Anchor Graph Memory(공간 메모리) 생성/갱신
-- Discovered Context(DC) FIFO 큐 생성/갱신 및 Planner 입력에 포함
-- Action 기반 dead reckoning으로 anchor 좌표 누적 및 간이 localization(근접+의미 기반)
+### 0.1 Decided
+1) **Event‑driven planning**
+- Run the heavy pipeline only on:
+  - **Episode Start**
+  - **Re‑planning Event** = PixelNav outputs **STOP** while **goal_flag == False**
 
-### 1.2 제외(Out-of-scope)
-- IMU/휠 인코더 기반 정밀 odometry/SLAM
-- 정확한 metric map 구축/loop-closure 최적화(SLAM-level)
-- 다중 로봇 협업/지도 공유
+2) **Planner pipeline stays**
+- **Planner VLM**: (panoramic image + nav context) → **angle_slot & goal_flag**
+- **DINO/SAM + PixelNav**: take that direction → execute low‑level actions
 
----
+3) **Circular Memory purpose**
+- Primary: **revisit detection** + **local yaw alignment** (rotation alignment)  
+- Implemented via **circular shift matching** between semantic sequences
 
-## 2. 용어 정의(Glossary)
-- **Planner VLM**: 파노라마 관측과 Navigation Context를 바탕으로 다음 이동 방향을 결정하는 상위 의사결정 모듈.
-- **Pixel-Guided Navigation Policy (PixelNav)**: DINO/SAM 기반 시각적 단서로 waypoint를 선택하고 이산 행동(Action)을 출력하는 저수준 주행 정책.
-- **Scene VLM (Scene Analyzer)**: 현재 관측으로부터 scene_type(공간 타입 문자열)을 추정하는 모듈(Vertex Endpoint 호출).
-- **Place**: 의미적으로 일관된 공간 단위(방, 복도 등). 시간이 흐르며 요약 정보가 축적됨.
-- **Anchor**: 이동 경로상의 위상적 기준점. Place 간 연결 구조와 간이 localization의 최소 단위.
-- **Navigation Context**: Planner VLM 입력에 포함되는 메모리 스냅샷. (Place/Anchor 기록 + DCQueue + Localization 상태 + 시스템 프롬프트)
-- **Discovered Context (DC)**: Planner VLM이 “다음에 어떤 공간 타입을 목표로 할지/이유”를 짧게 기록한 로그. 반복 주행을 줄이기 위한 negative memory 역할.
-- **Oscillation**: 같은 장소를 맴돌거나 A→B→A 형태 반복으로 탐색 진전이 없는 현상.
-- **Deadlock**: 탐색이 사실상 정지하거나 동일 행동 반복으로 진행되지 않는 상태.
+4) **Semantic sequence representation**
+- Use **object name tokens only** (fixed vocabulary)
+- **Do NOT** use free‑form attributes (size/color/distance/material/etc.), because they vary with pose/lighting and break matching
 
----
+5) **Door ID + Door Memory is required**
+- To prevent oscillation **before entering a door**, Planner must see door visitation status **in advance**
+- Therefore, **door tokens inside the circular list must carry door state**
+  - Example: `door(id=2, visited=false)` inside the sequence itself
 
-## 3. 구현 상 사실(코드 기준 Traceability)
-- Planner VLM 모델명은 **gemini-2.5-flash-lite**를 사용한다.
-  - `gpt4v_planner.py` → `gpt_request.py`의 `MODEL_NAME = "gemini-2.5-flash-lite"`를 통해 Vertex AI 호출
-- Scene 분석용 VertexAIClient는 코드에서 특정 endpoint_id를 사용한다.
-  - `objnav_benchmark.py`에서 endpoint_id를 지정
-  - 실제 Gemini 버전은 코드에 직접 표기돼 있지 않으며 **GCP 콘솔의 Vertex Endpoint 설정**을 확인해야 한다.
-  - wrapper: `vertex_client_wrapper.py`
+6) **Visited=true trigger is explicit**
+- Mark a door **visited=true** only when **scene transition is confirmed**
+  - If we chose a door and, after executing, **SceneType changes** and the change is confirmed (stable), then the chosen door becomes visited
+  - If STOP without scene change: not “visited”, just an attempt/failure record
+
+7) **Single‑episode scope**
+- Place IDs, Door IDs, DCQueue, Circular Storage, DoorMemory 모두 **episode 종료 시 초기화**
 
 ---
 
-## 4. 시스템 아키텍처 개요
-시스템은 두 개의 루프가 진행된다.
-
-1) **Navigation Loop (상위 의사결정 시점마다 실행)**  
-- Input: panoramic image, target object, Navigation Context  
-- Output: Action(forward, turn_left, turn_right, stop)
-
-2) **Spatial Memory Update Loop (주기적/이벤트 기반 실행)**  
-- Anchor 생성/갱신 (dead-reckoning 기반)  
-- 주기적으로 Scene VLM을 호출해 Place 생성/갱신  
-- Navigation Context 레코드 업데이트
+### 0.2 Not fully decided (open items)
+- Exact object vocabulary list (final fixed set)
+- Exact similarity function (how robust / how strict)
+- How to handle:
+  - repeated objects (chair chair chair)
+  - missing detections / hallucinations
+  - open spaces with weak “door” cues
+  - similar corridors (aliasing)
+- SceneType VLM stability rule (k confirmations)
 
 ---
 
-## 5. 전체 시퀀스(Sequence)
-
-### 5.1 Navigation Loop
-1. 입력 구성
-   - panoramic image (현재 관측)
-   - target object (목표 객체 명/클래스)
-   - Navigation Context (Place/Anchor + DCQueue + Localization + system prompt)
-2. Planner VLM 호출
-   - 반환: `goal_flag`, `angle`, `discovered_context`(object)
-3. Perception + Policy
-   - goal_flag + angle을 DINO & SAM에 전달하여 goal object/관련 마스크/후보를 생성 (10절 참조)
-   - Pixel-Guided Navigation Policy가 waypoint를 선택하고 Action을 출력
-4. DCQueue 업데이트
-   - Planner 출력 `discovered_context`로 DCRecord 1개 생성하여 FIFO 큐에 push (최대 5개 유지)
-   - `avoid_hint`는 시스템이 규칙 기반으로 계산하여 DCRecord에 추가(Optional)
-
-### 5.2 Spatial Memory Update Loop
-1. Anchor 업데이트
-   - Navigation Loop의 Action을 dead reckoning으로 누적하여 (x, y, yaw)을 갱신
-   - Anchor 생성 조건을 만족하면 새 anchor를 생성하고 neighbors를 연결
-2. Place 업데이트 (주기: 매 20 step)
-   - Scene VLM으로 현재 scene_type(place_type 문자열)을 추정
-   - place 전환 감지 시 새 Place 생성 또는 기존 Place 갱신
-3. Navigation Context 재구성
-   - 최신 Place/Anchor 요약, DCQueue, Localization 상태를 prompt에 포함 가능하도록 직렬화
+### 0.3 Lacked / risks identified (must be documented)
+- Object omissions cause mismatch → need thresholding + robust scoring
+- SceneType false positives → can incorrectly mark door visited
+- Similar-looking regions (corridor aliasing) → revisit mistakes
+- Door detection purely from VLM tokens may be unstable → need contract + normalization
 
 ---
 
-## 6. Planner 호출 주기(코드 운영 규칙)
-- Planner VLM 호출은 **항상 매 step이 아니다.**
-- 기본 규칙:
-  1) 에피소드 시작 시 1회 Planner VLM 호출
-  2) 이후 low-level policy(PixelNav)가 `STOP`을 출력했지만 **`goal_flag == false`인 경우**, Planner VLM을 1회 재호출하여 새로운 방향/의도를 갱신한다.
+## 1) Scope & Non‑Goals
 
-(향후 확장 가능: stuck/ABABA 감지 시 재호출 트리거 추가 가능)
+### 1.1 Scope (what we build)
+- Habitat ObjectNav‑style episode navigation:
+  - Start somewhere
+  - Goal: find target object (e.g., bed)
+  - Use perception + memory to decide waypoint direction repeatedly
+- System is **metric‑free**:
+  - no global map coordinates
+  - no distance/angle values (only discrete indices, tokens, and IDs)
 
----
-
-## 7. 데이터 구조(Data Model)
-
-### 7.1 Place
-**정의**: 의미적으로 일관된 공간 영역을 나타내며, 탐색 경험이 누적되는 단위.
-
-- place_id: string/int (유일 식별자)
-- place_type(scene_type): string (모델 출력 문자열; 정규화 규칙은 7.3 참조)
-- objects_list: set[string]  
-  - 누적된 대표 객체/구조 단서 (예: "sofa", "sink", "stove")
-- semantic_description: string  
-  - place를 요약한 1~2문장 서술(짧게)
-- anchors: list[anchor_id]
-
-**생성/갱신 규칙**
-- 주기: 매 20 step마다 Scene VLM 호출
-- place_type 전환 감지는 “정규화된 scene_type 문자열” 기반으로 판단
-- (권장 초기값) dwell_time: 최근 k step 동안 동일 scene_type 유지 시 확정 (k=3)
-- 전환 시: 새 Place 생성 + 해당 시점 anchor를 Place의 첫 anchor로 등록
-
-### 7.2 Anchor
-**정의**: 이동 경로상에서 생성되는 위상적 기준점. 연결 구조(neighbors)와 간이 localization의 최소 단위.
-
-- anchor_id: string/int
-- pose: (x: float, y: float, yaw: float)  # dead reckoning 누적 좌표
-- neighbors: list[anchor_id]
-- place_id: place_id
-
-**dead reckoning 업데이트 규칙 (Habitat-Sim 설정과 정합)**
-- 시작 pose = (0, 0, 0)
-- Action을 아래로 해석해 pose 누적
-  - forward: +d 만큼 yaw 방향으로 이동 (기본 d=0.25)
-  - turn_left: yaw += +30deg
-  - turn_right: yaw += -30deg
-  - stop: 변화 없음
-
-> NOTE: 본 시스템은 글로벌 GT pose를 사용하지 않으며, Action 기반 누적은 drift를 포함할 수 있다.
-> (SLAM 수준의 보정/최적화는 Out-of-scope)
-
-**Anchor 생성 조건(최소 하나 이상 만족 시 생성)**
-- 일정 거리: 마지막 anchor 이후 forward 누적이 S step 이상 (기본 S=2)
-- 방향 변화: yaw 변화(회전)가 발생했고, 회전 후 forward가 1회 이상 수행됨
-- 분기점 이벤트: 문/교차로 등 분기 감지 플래그 true (구현 시 TBD)
-- 새로운 Place 진입 시 “첫 anchor”는 반드시 생성
+### 1.2 Non‑Goals
+- Building a metric map / SLAM / odometry system
+- Cross‑episode memory (disallowed)
+- Continuous control policy design (PixelNav is assumed existing)
 
 ---
 
-## 8. Localization (간이)
+## 2) Key Definitions (Terminology)
 
-### 8.1 배경
-- IMU/휠 인코더 odometry를 사용하지 않는다.
-- 대신 Action 기반 dead reckoning으로 생성된 anchor 좌표계를 사용한다.
+### 2.1 Discrete direction
+- We represent 360° as **K discrete slots**: `slot ∈ {0..K-1}`
+- This is NOT a metric angle. It is an index.
 
-### 8.2 근접 + 의미 기반 “동일 공간 후보” 검색
-- 현재 anchor A에서, 모든 anchor B에 대해 dist(A,B)를 계산한다.
-- dist(A,B) <= r 이고, `norm_scene_type(A) == norm_scene_type(B)` 이면 “동일 공간 후보”로 간주한다.
-- r 기본값: 1.5 (Habitat 단위 기준; 튜닝 가능)
+### 2.2 Scan (one event snapshot)
+- At a trigger event, robot performs a **360 scan**
+- Output:
+  - panoramic image (for Planner VLM)
+  - semantic circular list (for memory + matching)
+  - door list with door states embedded
 
-### 8.3 정책
-- 본 localization 결과는 **그래프 병합/loop-closure에 사용하지 않는다.**
-- 오직 Planner 입력에 “nearby 후보 힌트”로만 제공(Optional)한다.
+### 2.3 Semantic token
+- A token is a single item from a fixed vocabulary, e.g.:
+  - `bed`, `lamp`, `wardrobe`, `sofa`, `door`, `toilet`, ...
+- No free‑form adjectives.
 
----
+### 2.4 Circular list / circular sequence
+- A list that represents a circle; start index is arbitrary.
+- Matching is done by circular shifting.
 
-## 9. Navigation Context 정의 및 직렬화
+### 2.5 Place
+- A **Place** is an episode‑local ID assigned to a recurring semantic circular pattern.
+- A place is NOT a coordinate.
 
-### 9.1 포함 내용
-- Place 요약(최근 M개 또는 현재 place 중심)
-- Anchor 요약(현재 anchor, 인접 neighbors, 최근 K step anchor 시퀀스)
-- Discovered Context Queue(최대 5개, 시간 순서)
-- Localization 상태(현재 pose, current_place_id, current_anchor_id, 후보 anchor 목록 요약(Optional))
-- system prompt(출력 포맷 강제 및 금지사항)
-
-### 9.2 scene_type / place_type 정규화 규칙(코드 기준)
-- Scene VLM/Planner가 반환하는 scene_type 문자열은 **그대로 수용**한다(고정 enum 없음).
-- 내부 로직에서는 아래 최소 정규화만 수행한다:
-  - 소문자화
-  - 마침표/특수문자 제거
-  - `"hallway" -> "corridor"` 치환
-- 특별 취급: `"corridor" in scene_type` 여부를 별도 조건으로 사용 가능(기존 코드 로직과 정합).
+### 2.6 Door
+- A **Door** is a special token type that connects places.
+- Doors are assigned IDs and tracked to avoid oscillation.
 
 ---
 
-## 10. Discovered Context(DC) 상세
+## 3) High‑Level Architecture
 
-### 10.1 정의
-DC는 Planner VLM이 현재 관측 + Navigation Context를 바탕으로 내린
-- “다음 목표 공간 타입(goal_scene_type)”과
-- “그 이유(why)”
-를 짧게 기록하는 온라인 컨텍스트 로그이다.
+### 3.1 Modules
+1) **Scanner**
+- Rotates robot (in sim) to obtain per‑slot RGB observations
 
-### 10.2 생성 규칙
-- Planner VLM 호출 1회당 DCRecord 1개 생성
-- DC는 Place/Anchor의 정적 요약(semantic_description, objects_list)을 반복하지 않는다.
+2) **Scene VLM (Object Token Extractor)**
+- For each slot image, outputs a small list of **object tokens only**
 
-### 10.3 최소 필드(Min-DC)
-- idx: 1..N (1=가장 오래된, N=가장 최신; 매 호출 시 재부여)
-- goal_flag: boolean (현재 관측에서 목표 객체가 보이면 true)
-- goal_scene_type: string (Planner가 반환한 문자열; 고정 enum 아님)
-- why: string (1문장, 짧게)
-- optional avoid_hint: string (규칙 기반)
+3) **Circular Memory**
+- Stores the last N scan circular lists in time order
+- Supports circular shift matching for revisit + alignment
 
-### 10.4 저장 규칙(Queue)
-- FIFO Queue, 최대 크기 N=5
-- 새 레코드 push 시 overflow면 가장 오래된 항목 pop
-- 매 Planner 호출 시 idx를 1..N으로 재부여
-- Planner 입력 시 idx=1→N 순서로 포함
+4) **SceneType VLM**
+- Separate VLM that outputs a coarse scene label (place type) for transition confirmation
+- Used primarily to mark door visited
 
-### 10.5 avoid_hint 생성 규칙(규칙 기반)
-- avoid_hint는 VLM이 생성하지 않고, 최근 Anchor/Place 시퀀스에서 패턴을 계산해 제공한다.
-- 최소 지원:
-  - pattern:STUCK  (최근 W step 동안 unique_places <= 1; 기본 W=10)
-  - pattern:ABABA  (최근 4개 place가 A,B,A,B 이고 A!=B)
+5) **Planner VLM**
+- Inputs: panoramic + nav context
+- Outputs: `angle_slot`, `goal_flag`, `why`
 
----
+6) **DINO/SAM**
+- Uses `angle_slot` to focus attention/ROI and generate masks/targets
 
-## 11. Planner VLM 입출력 규격
+7) **PixelNav Policy**
+- Low‑level actions until STOP or termination
 
-### 11.1 입력(요약)
-- panoramic image (또는 이미지 참조)
-- target object (string)
-- Navigation Context (텍스트/JSON 직렬화)
+8) **DCQueue**
+- Stores Planner decisions and outcomes (learning‑style episodic log)
 
-### 11.2 출력(엄격)
-Planner VLM은 반드시 아래 JSON만 출력한다(추가 텍스트 금지).
-
-예시:
-{
-  "goal_flag": true,
-  "angle": 15.0,
-  "discovered_context": {
-    "goal_scene_type": "kitchen",
-    "why": "주방은 목표와 연관된 물체가 있을 확률이 높음"
-  }
-}
-
-- goal_flag: boolean
-- angle: float
-  - 정의: 파노라마 기준 “정면(0deg)”에서의 상대 방위각(도 단위)
-  - 양수=좌회전, 음수=우회전
-  - 권장 범위: [-180, 180]
-- discovered_context.goal_scene_type: string (모델 출력 문자열)
-- discovered_context.why: 1문장
-
-### 11.3 출력 검증/오류 처리
-- JSON 파싱 실패, 필드 누락, angle 범위 밖 등의 오류가 발생하면:
-  1) **재시도 1회**
-  2) 재시도 실패 시 fallback 적용:
-     - goal_flag=false
-     - angle=0
-     - discovered_context.goal_scene_type="corridor"
-     - discovered_context.why="fallback"
+9) **DoorMemory**
+- Stores per‑door experience within the episode (visited/attempts/outcomes/optional edge)
 
 ---
 
-## 12. PixelNav / DINO / SAM 인터페이스(최소 정의, TBD)
-- DINO/SAM은 goal_flag/angle을 이용해 “목표 객체 후보” 또는 “waypoint 생성에 필요한 시각적 단서”를 만든다.
-- 최소 요구:
-  - angle을 이용해 파노라마에서 관심 방향 ROI를 결정하거나,
-  - goal object 탐지를 위한 prior로 사용한다.
-- 실제 구현은 PixelNav 코드베이스 입력 포맷에 맞춰 통일(TBD).
+## 4) Episode Lifecycle (State Machine)
+
+### 4.1 Episode states
+- INIT
+- SCAN_AND_UPDATE (triggered on Episode Start or Re‑planning)
+- PLAN
+- EXECUTE
+- TERMINATE
+
+### 4.2 Transition rules
+- INIT → SCAN_AND_UPDATE (Episode Start)
+- SCAN_AND_UPDATE → PLAN
+- PLAN → EXECUTE
+- EXECUTE → TERMINATE (goal achieved OR max steps)
+- EXECUTE → SCAN_AND_UPDATE if (PixelNav STOP && goal_flag == False)
 
 ---
 
-## 13. 로깅/디버깅 요구사항
-- 매 step 로그:
-  - step_id, action, pose(x,y,yaw), current_place_id, current_anchor_id
-  - Planner VLM 호출 여부, 출력 JSON
-  - DCQueue(최대 5개)
-- 이벤트 로그:
-  - place 생성/전환 시점, anchor 생성 시점, ABABA/STUCK 감지 시점
-  - fallback 발생 횟수/사유
+## 5) Data Contracts (Strict Interfaces)
+
+### 5.1 Fixed vocabulary
+- A single list: `VOCAB = {...}` must be fixed before experiments.
+- Scene VLM must output only tokens from VOCAB.
+- Any out‑of‑vocab output must be:
+  - mapped to `unknown` (optional), or
+  - dropped (recommended early stage)
+
+### 5.2 Scene VLM output (per slot)
+For each slot image:
+- Output: list of tokens (order not critical per slot; order is across slots)
+
+Example per slot:
+- `["door", "sofa", "lamp"]`
+
+### 5.3 Scan output (per event)
+A scan produces:
+- `slot_tokens[i]`: token list for slot i
+- `circular_list`: circular representation (defined below)
+- `door_tokens`: doors with IDs and states embedded
+- `pano_image`: panoramic image for Planner
+
+### 5.4 Planner output (strict JSON)
+Required fields:
+- `angle_slot`: integer in [0, K-1]
+- `goal_flag`: boolean
+- `why`: short text (can be stored in DCQueue)
+
+Optional:
+- `chosen_door_id`: integer (if Planner explicitly chooses a door)
 
 ---
 
-## 14. 평가 지표(Evaluation)
-- 기본: SR, SPL (PixelNav baseline 대비)
-- Oscillation/Deadlock 보조 지표(최소 1개 이상)
-  - ABABA 발생 횟수/에피소드
-  - STUCK 발생 횟수/에피소드
-  - 최근 W step 동안 unique place 비율
+## 6) Core Representation
+
+### 6.1 Slot‑wise representation (recommended)
+Instead of a single flat list of tokens, store K slots each with tokens:
+- `S = [S0, S1, ..., S(K-1)]`
+- Each `Si` is a multiset/list of tokens for that direction.
+
+This makes matching more robust than a single flat sequence.
+
+### 6.2 Door token embedding
+Within each slot’s token list, a door token becomes a structured token:
+
+- `door(id=<int>, visited=<bool>, attempts=<int>, last_result=<enum>)`
+
+But to keep Planner input simple:
+- Minimal: `door(id=X, visited=true/false)`
+- Add more fields later.
 
 ---
 
-## 15. 기본 파라미터(Default Parameters, 초기값)
-- forward step distance d = 0.25
-- turn angle = 30deg
-- place update period = 20 step
-- Planner 호출: episode start + (STOP && goal_flag==false)일 때
-- DCQueue max size N = 5
-- localization radius r = 1.5 (tune)
-- stuck window W = 10
-- anchor distance threshold S = 2 step
-- dwell_time k = 3 (place 전환 확정)
+## 7) Circular Shift Matching (Revisit + Alignment)
+
+### 7.1 Purpose
+Given current scan `S_cur` and past scans `S_past`:
+- Find best matching past place (if any)
+- Compute best circular shift (yaw alignment index)
+- Produce a score and revisit decision
+
+### 7.2 Similarity: robust to missing tokens
+We do NOT require perfect match.
+We compute per-slot similarity and sum across slots.
+
+**Per-slot similarity (Jaccard on token sets)**
+- Convert each slot token list to a set (or multiset) excluding door metadata (use just “door” presence for base revisit, or ignore doors entirely for place matching).
+- Jaccard:
+  - `sim_slot = |A ∩ B| / |A ∪ B|`
+- Total:
+  - `sim_total = (1/K) * Σ sim_slot`
+
+This survives:
+- missing lamp
+- extra noise token
+- lighting/pose variations (since we only use names)
+
+### 7.3 Best shift computation
+For each shift `s` in [0..K-1], compare:
+- `S_cur[i]` with `S_ref[(i+s) mod K]`
+
+Pseudo:
+
+    def jaccard(a_set, b_set):
+        if len(a_set) == 0 and len(b_set) == 0:
+            return 1.0
+        return len(a_set & b_set) / max(1, len(a_set | b_set))
+
+    def score_shift(S_ref, S_cur, shift):
+        total = 0.0
+        for i in range(K):
+            A = normalize_tokens(S_ref[i])   # set of tokens
+            B = normalize_tokens(S_cur[(i+shift) % K])
+            total += jaccard(A, B)
+        return total / K
+
+    def best_shift_and_score(S_ref, S_cur):
+        best_s, best_score = 0, -1
+        for s in range(K):
+            sc = score_shift(S_ref, S_cur, s)
+            if sc > best_score:
+                best_score = sc
+                best_s = s
+        return best_s, best_score
+
+### 7.4 Place matching across all stored places
+We maintain a set of place prototypes, each with one or more representative scans:
+
+    def match_place(place_db, S_cur):
+        best = None  # (score, place_id, shift)
+        for place_id, reps in place_db.items():
+            for S_rep in reps:
+                shift, score = best_shift_and_score(S_rep, S_cur)
+                if best is None or score > best[0]:
+                    best = (score, place_id, shift)
+        return best  # may be None if db empty
+
+### 7.5 Revisit decision and place assignment
+Let best match be `(score*, place_id*, shift*)`.
+
+Decision rule:
+
+- If `score* >= T_revisit`: revisit=True, assign existing `place_id*`
+- Else: revisit=False, create new place_id, register S_cur as representative
+
+Pseudo:
+
+    def assign_place(place_db, S_cur, T_revisit):
+        if len(place_db) == 0:
+            new_id = new_place_id()
+            place_db[new_id] = [S_cur]
+            return new_id, 0, 1.0, False
+
+        best = match_place(place_db, S_cur)
+        score, pid, shift = best
+        if score >= T_revisit:
+            # optionally append S_cur as additional representative
+            maybe_add_representative(place_db[pid], S_cur)
+            return pid, shift, score, True
+        else:
+            new_id = new_place_id()
+            place_db[new_id] = [S_cur]
+            return new_id, 0, score, False
 
 ---
 
-## 16. 구현 체크리스트(Implementation Checklist)
-- [ ] Navigation Context 직렬화 함수 (요약형)
-- [ ] Planner VLM 호출 래퍼 + 출력 JSON 검증기 + retry/fallback
-- [ ] DCQueue 자료구조(FIFO, re-index) + avoid_hint 규칙 계산
-- [ ] Action -> dead reckoning pose 누적
-- [ ] Anchor 생성/연결(neighbors)
-- [ ] Scene VLM 호출 래퍼 + scene_type 정규화
-- [ ] Place 업데이트(20 step 주기 + 전환 규칙)
-- [ ] 간이 localization(근접 + 의미) + 힌트 제공(병합 없음)
-- [ ] 로그/재현 가능한 실험 설정(seed, config)
+## 8) Door ID & Door Memory (Anti‑Oscillation)
+
+### 8.1 Goal
+Prevent oscillation like:
+
+- A → (door to B) → B → (door back to A) → A → chooses same door again → repeat
+
+We must know **at A, before entering**, which door was already used.
+
+### 8.2 Door identification within a place
+Within a place, doors are identified as tokens in slots.
+We assign a door_id **episode‑locally** as `(place_id, door_id)`.
+
+### 8.3 Door matching rule (simple, robust, metric‑free)
+We do NOT rely on degrees/meters.
+We rely on:
+- shift alignment from place match
+- slot neighborhood context around the door
+
+**Door signature** (context window)
+- For a door located at slot `i`, define signature as tokens in window W:
+
+    signature(i) = normalize_tokens(S[i-W .. i+W])  (circular wrap)
+
+Then match doors by signature similarity (Jaccard).
+
+Pseudo:
+
+    def door_signature(S, i, W):
+        tokens = set()
+        for d in range(-W, W+1):
+            tokens |= normalize_tokens(S[(i+d) % K])
+        # ensure 'door' is included to anchor
+        tokens.add('door')
+        return tokens
+
+    def match_or_create_door_id(place_id, S_cur, i_door, door_db, W, T_door):
+        sig = door_signature(S_cur, i_door, W)
+
+        # door_db maps (place_id) -> list of (door_id, signature_proto)
+        candidates = door_db.get(place_id, [])
+
+        best = None  # (score, door_id)
+        for door_id, proto_sig in candidates:
+            score = jaccard(proto_sig, sig)
+            if best is None or score > best[0]:
+                best = (score, door_id)
+
+        if best is not None and best[0] >= T_door:
+            return best[1], sig  # reuse id
+        else:
+            new_door_id = new_door_id_for_place(place_id)
+            candidates.append((new_door_id, sig))
+            door_db[place_id] = candidates
+            return new_door_id, sig
+
+### 8.4 Embedding door state into the circular list
+After door_id assignment, augment door tokens in slots:
+
+- `door(id=X, visited=<bool>)`
+
+`visited` comes from DoorMemory.
+
+### 8.5 DoorMemory structure (episode‑local)
+DoorMemory key: `(place_id, door_id)`
+
+Fields (minimum):
+- `visited: bool`
+- `attempts: int`
+- `successes: int` (optional)
+- `fails: int`
+- `last_result: enum {scene_changed, stop_no_change, goal_found, timeout}`
+- `leads_to_place_id: optional` (set after transition)
+
+### 8.6 “visited=true” update rule (SceneType confirmed)
+This is a must‑have contract.
+
+We maintain an **ActiveDoorAttempt** when Planner chooses a door:
+
+ActiveDoorAttempt:
+- start_place_id
+- chosen_door_id
+- start_scene_type
+- status = ACTIVE
+
+During/after EXECUTE:
+- run SceneTypeVLM check
+- confirm scene transition using stability K_confirm
+
+Pseudo:
+
+    def confirm_scene_change(scene_history, K_confirm):
+        # scene_history is recent scene_type labels
+        # change is confirmed if the last K_confirm labels are identical and different from start
+        if len(scene_history) < K_confirm:
+            return False, None
+        last = scene_history[-1]
+        if all(x == last for x in scene_history[-K_confirm:]):
+            return True, last
+        return False, None
+
+    def finalize_door_attempt(active_attempt, scene_history, DoorMemory, current_place_id):
+        key = (active_attempt.start_place_id, active_attempt.chosen_door_id)
+        DoorMemory[key].attempts += 1
+
+        changed, new_scene = confirm_scene_change(scene_history, K_confirm)
+        if changed and new_scene != active_attempt.start_scene_type:
+            DoorMemory[key].visited = True
+            DoorMemory[key].last_result = "scene_changed"
+            DoorMemory[key].leads_to_place_id = current_place_id
+        else:
+            DoorMemory[key].last_result = "stop_no_change"
+            DoorMemory[key].fails += 1
+
+**Interpretation**:
+- A door is “visited” only if we truly crossed into a different scene type stably.
+- Otherwise: attempted but not visited.
+
+This matches the conversation requirement:
+> “문을 들어가기 전에 판단해야 한다.  
+> 그래서 door token에 visited 상태를 미리 넣는다.  
+> visited는 scene change 확인 시점에서 true로 업데이트한다.”
+
+---
+
+## 9) Circular Storage (time‑ordered, last N)
+
+### 9.1 What is stored
+Store scans in time order:
+- `HistoryScans = [Scan_t-2, Scan_t-1, Scan_t]`
+
+Each Scan contains:
+- `place_id`
+- `S_slots` (with door tokens and visited flags already embedded)
+- `best_shift` (alignment hint relative to matched place prototype)
+- `match_score`
+- `planner_decision` (angle_slot, goal_flag)
+- `outcome` (stop_no_change / scene_changed / goal_found)
+
+### 9.2 Why last 2–3
+- Helps Planner avoid repeating failed choice
+- Helps detect oscillation patterns even if door visited wasn’t updated yet
+
+---
+
+## 10) DCQueue (Planner decision log + outcome)
+
+### 10.1 Purpose
+DCQueue is the Planner’s “learning‑style episode memory”:
+- decision + rationale + resulting outcome
+- used to discourage repeating obviously bad choices
+
+### 10.2 Entry format (episode‑local)
+Fields:
+- `place_id`
+- `angle_slot`
+- `goal_flag`
+- `why`
+- `result` (stop_no_change / scene_changed / goal_found / timeout)
+- optional `chosen_door_id`
+
+---
+
+## 11) Nav Context to Planner (make it maximally intuitive)
+
+Planner must “just read it” and choose.
+
+Recommended nav context structure:
+
+1) **System rules**
+- strict output JSON schema
+- do not output metric units
+- prefer unvisited doors unless contradicted by goal cues
+
+2) **Goal**
+- target object name (e.g., “bed”)
+
+3) **Current scan circular list**
+- slots 0..K-1, each with tokens
+- doors appear as `door(id=, visited=)`
+
+4) **Recent history (last 2–3 scans)**
+- for each: circular list + decision + outcome (short)
+
+5) **Localization hints**
+- current place_id
+- revisit flag and match_score
+- best_shift index (optional to show; can be used internally)
+
+---
+
+## 12) Planner → Execution binding (how angle_slot relates to door)
+
+Planner outputs `angle_slot`. We must bind that to a door_id if the slot contains multiple doors or none.
+
+Binding rule (simple):
+- If Planner outputs a slot containing a door token → choose that door
+- Else choose nearest slot in circular distance that contains a door and is unvisited (tie-break by minimal distance; still metric‑free since it’s index distance)
+
+Pseudo:
+
+    def circular_distance(a, b, K):
+        d = abs(a - b)
+        return min(d, K - d)
+
+    def choose_door_from_angle(S_slots, angle_slot, DoorMemory, place_id):
+        # exact match first
+        doors_here = list_doors_in_slot(S_slots[angle_slot])
+        if len(doors_here) > 0:
+            return doors_here[0]  # or prefer unvisited among them
+
+        # search nearest door slots
+        best = None  # (dist, visited_flag, door_id)
+        for i in range(K):
+            for door_id in list_doors_in_slot(S_slots[i]):
+                visited = DoorMemory[(place_id, door_id)].visited
+                dist = circular_distance(i, angle_slot, K)
+                candidate = (dist, visited, door_id)
+                # prefer smaller dist, prefer visited=false
+                if best is None:
+                    best = candidate
+                else:
+                    if candidate[0] < best[0]:
+                        best = candidate
+                    elif candidate[0] == best[0] and candidate[1] == True and visited == False:
+                        best = candidate
+        return best[2] if best else None
+
+---
+
+## 13) End‑to‑End Main Loop (Pseudo Code)
+
+    def run_episode(env, target_object):
+        # ===== episode-local memory reset =====
+        place_db = {}        # place_id -> list of representative S_slots
+        door_db  = {}        # place_id -> list of (door_id, proto_signature)
+        DoorMemory = {}      # (place_id, door_id) -> stats
+        DCQueue = []         # list of decisions+outcomes
+        HistoryScans = []    # last N scans
+
+        event = "EPISODE_START"
+
+        while not env.done():
+            if event in ["EPISODE_START", "REPLAN"]:
+                # 1) 360 scan
+                pano_image, slot_images = scanner_collect(env, K)
+
+                # 2) Scene VLM per slot -> tokens
+                S_slots = []
+                for i in range(K):
+                    tokens = scene_vlm_tokens_only(slot_images[i], VOCAB)
+                    S_slots.append(tokens)
+
+                # 3) Place assignment via circular shift matching
+                place_id, shift, match_score, revisit = assign_place(place_db, S_slots, T_revisit)
+
+                # 4) Door ID assignment & embedding visited flags
+                S_slots = embed_doors_with_ids_and_state(
+                    place_id, S_slots, door_db, DoorMemory,
+                    W=door_context_window, T_door=T_door
+                )
+
+                # 5) Build nav context (include last 2–3 HistoryScans + DCQueue)
+                nav_context = build_nav_context(
+                    target_object, S_slots, HistoryScans, DCQueue,
+                    place_id=place_id, revisit=revisit, match_score=match_score, shift=shift
+                )
+
+                # 6) Planner VLM
+                plan = planner_vlm(pano_image, nav_context)  # returns angle_slot, goal_flag, why
+
+                # 7) Choose door_id bound to plan.angle_slot (optional)
+                chosen_door_id = choose_door_from_angle(S_slots, plan.angle_slot, DoorMemory, place_id)
+
+                # 8) Execute low-level until STOP or termination condition
+                active_attempt = {
+                    "start_place_id": place_id,
+                    "chosen_door_id": chosen_door_id,
+                    "start_scene_type": scenetype_vlm(env.current_view()),
+                    "scene_history": []
+                }
+
+                outcome = execute_pixelnav_until_stop_or_goal(
+                    env, plan.angle_slot, target_object, active_attempt
+                )
+
+                # 9) After execution, update DoorMemory using SceneType confirmed
+                current_scene = scenetype_vlm(env.current_view())
+                active_attempt["scene_history"].append(current_scene)
+
+                # Possibly do a few checks / accumulate history if needed
+                # Then finalize
+                # Note: current_place_id will be computed next time at scan; for now store partial
+                update_door_memory_post_execution(DoorMemory, active_attempt, outcome)
+
+                # 10) Update DCQueue + HistoryScans
+                DCQueue.append({
+                    "place_id": place_id,
+                    "angle_slot": plan.angle_slot,
+                    "goal_flag": plan.goal_flag,
+                    "why": plan.why,
+                    "chosen_door_id": chosen_door_id,
+                    "result": outcome
+                })
+                DCQueue = DCQueue[-MAX_DCQUEUE:]
+
+                HistoryScans.append({
+                    "place_id": place_id,
+                    "S_slots": S_slots,
+                    "revisit": revisit,
+                    "match_score": match_score,
+                    "shift": shift,
+                    "plan": plan,
+                    "outcome": outcome
+                })
+                HistoryScans = HistoryScans[-N_HISTORY:]
+
+                # 11) Decide next event
+                if plan.goal_flag == True or outcome == "goal_found":
+                    return "SUCCESS"
+
+                if outcome == "stop_no_goal":
+                    event = "REPLAN"
+                else:
+                    # continue executing or trigger replan based on policy; canonical is STOP->REPLAN
+                    event = "REPLAN"
+
+            else:
+                event = "REPLAN"
+
+        return "FAIL"
+
+---
+
+## 14) Thought Experiment (ASCII) + System Walkthrough + What breaks
+
+### 14.1 Environment (Living, Hallway, Kitchen, Bedroom, Bathroom)
+    +-------------------+
+    |     BEDROOM       |
+    |   [bed] [desk]    |
+    |        |          |
+    +--------+----------+
+             |
+    +--------+----------+
+    |      HALLWAY      |
+    |    door   door    |
+    |   +------+        |
+    |   |BATH |         |
+    |   +------+        |
+    +--------+----------+
+             |
+    +--------+----------+
+    |       LIVING      |
+    |  sofa  table lamp |
+    |  door      door   |
+    |     +------+      |
+    |     |KITCH|       |
+    |     +------+      |
+    +-------------------+
+
+Start: Living corner  
+Goal: find **bed**
+
+### 14.2 Episode Start (Trigger)
+- 360 scan → object tokens per slot → circular list S_slots
+
+Living current scan (simplified):
+- Slots contain tokens; doors embedded with ids and visited flags:
+
+Example Planner‑visible representation:
+- slot 0: `[sofa, table]`
+- slot 1: `[lamp]`
+- slot 2: `[door(id=1, visited=false)]`  (to hallway)
+- slot 3: `[fridge, stove, door(id=2, visited=false)]` (to kitchen)
+- ...
+
+Planner sees target=bed.
+He picks `angle_slot` toward hallway door(id=1).
+
+### 14.3 Execute (PixelNav)
+- Move until STOP
+- SceneType changes from LIVING → HALLWAY (confirmed)
+- Therefore:
+  - door(id=1).visited = true
+
+### 14.4 Replan in HALLWAY
+New scan:
+- Detect doors: back to LIVING, to BEDROOM, to BATH
+- All visited=false except possibly the one used earlier
+Planner picks door to BEDROOM.
+
+Enter BEDROOM:
+- New scan contains `bed`
+Planner sets goal_flag=true → success.
+
+### 14.5 Oscillation prevention
+If agent returns to LIVING and replans:
+- door(id=1, visited=true) is visible **before entering**
+Planner prefers door(id=2, visited=false) or other unvisited exits.
+Thus A↔B bounce is reduced.
+
+---
+
+## 15) Failure Modes & Required Mitigations (Must‑Have in spec)
+
+### 15.1 Object omission / hallucination
+Problem:
+- VLM may drop `lamp` or hallucinate `chair`.
+
+Mitigation:
+- Use Jaccard‑based scoring per slot (not exact match).
+- Use threshold `T_revisit` and avoid “exact match” rule.
+
+### 15.2 Duplicate objects
+Problem:
+- `chair chair chair` indistinguishable.
+
+Mitigation (phase‑1): accept limitation and rely on other tokens.
+Mitigation (phase‑2): allow capped counts per token (“multiset bins”), still metric‑free.
+
+### 15.3 SceneType false positives
+Problem:
+- SceneType changes incorrectly → door incorrectly visited.
+
+Mitigation:
+- Confirm change only when stable for `K_confirm` consecutive checks.
+- If uncertain, keep door as attempted but not visited.
+
+### 15.4 Similar corridors (aliasing)
+Problem:
+- Two places look semantically similar → wrong revisit.
+
+Mitigation options:
+- Increase K (more slots) for higher resolution
+- Require higher T_revisit for revisit assignment
+- Store multiple representatives per place
+- Use history consistency (last 2–3 scans must agree)
+
+### 15.5 Doors in open spaces
+Problem:
+- “door” token might not appear.
+
+Mitigation:
+- Allow “opening” token in vocab later, but keep token‑only rule
+- If no door tokens exist, Planner chooses angle_slot based on object cues; DoorMemory not used.
+
+---
+
+## 16) Implementation Checklist (Engineering)
+
+### 16.1 Must‑have
+- [ ] Fixed VOCAB + strict normalization
+- [ ] Scanner: K slot images + pano image
+- [ ] Scene VLM token extractor (tokens only)
+- [ ] Circular shift matching (place assignment)
+- [ ] Place DB (episode local)
+- [ ] Door detection + door_id assignment + visited embedding
+- [ ] DoorMemory update via SceneType change confirmation
+- [ ] DCQueue logging (decision + result)
+- [ ] Planner prompt builder + JSON validator
+- [ ] Replanning loop: STOP & goal_flag false triggers scan+plan
+
+### 16.2 Nice‑to‑have
+- [ ] Multi‑representative place prototypes
+- [ ] Duplicate token handling (multisets)
+- [ ] Aliasing mitigation with history consistency
+
+---
+
+## 17) Final Method Statement (paper‑ready)
+We propose a **metric‑free ObjectNav system** that converts 360° observations into a **semantic circular memory** of object tokens. Revisits and yaw alignment are estimated via **circular shift matching**. Navigation decisions are produced by a **Planner VLM** conditioned on the current scan, the last few scan histories, and a **door‑experience memory** embedded directly into the circular list as `door(id, visited)` tokens. Door visitation is updated only upon **confirmed scene transition**, enabling oscillation avoidance **before entering doors**.
+
+---
+END (Canonical Spec)
+'''"""
+out_path = "/mnt/data/Development_Requirement_Proposal_Canonical.md"
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(content)
+out_path

@@ -2,9 +2,13 @@ import math
 import re
 import time
 from collections import deque, Counter
-from .data import Place, Anchor
+from .data import Place, Anchor, DCQueue
 from .reid import PlaceReIdentifier
 from utils.logger import Logger
+
+# Dead Reckoning Constants (Requirements.md Section 7.2)
+DR_FORWARD_DISTANCE = 0.25  # meters per forward step
+DR_TURN_ANGLE = math.radians(30)  # 30 degrees in radians
 
 class PlaceManager:
     """
@@ -54,6 +58,17 @@ class PlaceManager:
         self.pending_caption = None
         self.pending_scene_steps = 0
         self.DWELL_STEP_THRESHOLD = 3  # steps
+        
+        # Dead Reckoning Mode (Requirements.md Section 7.2)
+        self.use_dead_reckoning = False  # Set True to use action-based pose
+        self.dr_pose = (0.0, 0.0, 0.0)  # (x, y, yaw) accumulated from actions
+        
+        # Discovered Context Queue (Requirements.md Section 10)
+        self.dc_queue = DCQueue(max_size=5)
+        
+        # Place history for pattern detection (avoid_hint)
+        self.place_history = deque(maxlen=20)  # Recent place_ids
+        self.stuck_window = 10  # W parameter for STUCK detection
 
     def _check_l2_transition(self, context, caption="", scene_update=True):
         """
@@ -213,9 +228,29 @@ class PlaceManager:
         self.turn_since_anchor = False
         self.forward_after_turn = False
 
+    def _update_dead_reckoning(self, action):
+        """Update pose based on action (Requirements.md Section 7.2)."""
+        if action is None:
+            return
+        x, y, yaw = self.dr_pose
+        if action == "forward":
+            x += DR_FORWARD_DISTANCE * math.cos(yaw)
+            y += DR_FORWARD_DISTANCE * math.sin(yaw)
+        elif action == "turn_left":
+            yaw += DR_TURN_ANGLE
+        elif action == "turn_right":
+            yaw -= DR_TURN_ANGLE
+        # Normalize yaw to [-pi, pi]
+        yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
+        self.dr_pose = (x, y, yaw)
+
     def _update_action_state(self, action):
         if self.current_anchor is None or action is None:
             return
+        # Dead reckoning update
+        if self.use_dead_reckoning:
+            self._update_dead_reckoning(action)
+            self.robot_pose = self.dr_pose
         if action == "forward":
             self.steps_since_anchor += 1
             self.forward_steps_since_anchor += 1
@@ -226,6 +261,50 @@ class PlaceManager:
             self.steps_since_anchor += 1
             self.turn_since_anchor = True
             return
+
+    def compute_avoid_hint(self) -> str:
+        """
+        Rule-based avoid_hint calculation (Requirements.md Section 10.5).
+        Returns pattern string or empty.
+        """
+        if len(self.place_history) < 4:
+            return ""
+        
+        # Pattern: STUCK (unique_places <= 1 in last W steps)
+        recent = list(self.place_history)[-self.stuck_window:]
+        unique_places = len(set(recent))
+        if unique_places <= 1 and len(recent) >= self.stuck_window:
+            return "pattern:STUCK"
+        
+        # Pattern: ABABA (last 4 places are A,B,A,B where A!=B)
+        if len(self.place_history) >= 4:
+            last4 = list(self.place_history)[-4:]
+            if (last4[0] == last4[2] and last4[1] == last4[3] and last4[0] != last4[1]):
+                return "pattern:ABABA"
+        
+        return ""
+
+    def push_dc_record(self, goal_flag: bool, goal_scene_type: str, why: str):
+        """Push a new Discovered Context record with auto-computed avoid_hint."""
+        avoid_hint = self.compute_avoid_hint()
+        self.dc_queue.push(goal_flag, goal_scene_type, why, avoid_hint)
+        Logger.info("DC", f"Pushed DC: flag={goal_flag}, scene={goal_scene_type}, hint={avoid_hint}")
+
+    def reset_for_episode(self):
+        """Reset state for a new episode."""
+        self.places.clear()
+        self.anchors.clear()
+        self.current_anchor = None
+        self.current_place = None
+        self.robot_pose = (0.0, 0.0, 0.0)
+        self.dr_pose = (0.0, 0.0, 0.0)
+        self.vlm_buffer.clear()
+        self.stable_vlm_context = "unknown"
+        self._init_waits = 0
+        self.edges.clear()
+        self.dc_queue.clear()
+        self.place_history.clear()
+        self._reset_anchor_counters()
 
     def update(self, current_pose, vlm_data, detected_objects, action=None):
         """
@@ -427,10 +506,10 @@ class PlaceManager:
         
         return total_pruned
 
-    def get_nav_context(self):
+    def get_nav_context(self, include_dc_queue: bool = True):
         """
         Generates a natural language summary of the current spatial context.
-        Used for VLM Prompt Injection.
+        Used for VLM Prompt Injection (Requirements.md Section 9).
         """
         if not self.current_place:
             return "You are in an unknown area."
@@ -438,43 +517,58 @@ class PlaceManager:
         # 1. Current Place Info & Exploration Status
         anchor_count = len(self.current_place.anchors)
         expl_status = "New/Unexplored"
-        if anchor_count > 10:  # Lowered from 15 to 10 to trigger "Escape" sooner
+        if anchor_count > 10:
             expl_status = "Extensively Explored"
-        elif anchor_count > 4: # Lowered from 5
+        elif anchor_count > 4:
             expl_status = "Partially Explored"
             
         place_info = f"You are currently in {self.current_place.place_type} (Place ID: {self.current_place.place_id}).\n"
-        place_info += f"Exploration Status: {expl_status} ({anchor_count} nodes mapped here)." 
-
+        place_info += f"Exploration Status: {expl_status} ({anchor_count} nodes mapped here)."
         
-        # 2. Description (Caption)
+        # 2. Localization State (Requirements.md Section 9.1)
+        x, y, yaw = self.robot_pose
+        loc_info = f"Current Pose: x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.1f}deg"
+        if self.current_anchor:
+            loc_info += f" (Anchor: {self.current_anchor.anchor_id})"
+        
+        # 3. Description (Caption)
         desc_info = ""
         if self.current_place.semantic_description:
             desc_info = f"Description: {self.current_place.semantic_description}"
             
-        # 3. Object Context
+        # 4. Object Context
         obj_info = ""
         objs = sorted(self.current_place.objects_list)
         if objs:
-            # Sort by count or just list top 5
             top_objs = objs[:10] 
             obj_info = f"Visible objects nearby: {', '.join(top_objs)}."
             
-        # 4. History (Visited Places)
+        # 5. History (Visited Places)
         visited = []
         for p in self.places.values():
             if p.place_id != self.current_place.place_id:
                 visited.append(p.place_type)
-        # Deduplicate
         visited = list(set(visited))
-        
         history_info = "You have previously explored: " + (", ".join(visited) if visited else "None") + "."
         
+        # 6. Discovered Context Queue (Requirements.md Section 10)
+        dc_info = ""
+        if include_dc_queue and len(self.dc_queue) > 0:
+            dc_info = "<Discovered Context History>\n" + self.dc_queue.to_prompt_string()
+        
+        # 7. Avoid Hint (Current)
+        current_hint = self.compute_avoid_hint()
+        hint_info = ""
+        if current_hint:
+            hint_info = f"⚠️ WARNING: {current_hint} detected. Consider changing strategy."
+        
         # Combine
-        lines = [place_info]
+        lines = [place_info, loc_info]
         if desc_info: lines.append(desc_info)
         if obj_info: lines.append(obj_info)
         lines.append(history_info)
+        if dc_info: lines.append(dc_info)
+        if hint_info: lines.append(hint_info)
         
         return "\n".join(lines)
 

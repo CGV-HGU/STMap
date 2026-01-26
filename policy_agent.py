@@ -43,7 +43,7 @@ class Policy_Agent:
         self.predict_length += 1
         if early_stop and self.predict_length > 32:
             return_action = 0
-        return return_action,cv2.cvtColor(return_goal,cv2.COLOR_BGR2RGB)
+        return return_action, cv2.cvtColor(return_goal,cv2.COLOR_BGR2RGB), float(return_distance[0])
         
 
 

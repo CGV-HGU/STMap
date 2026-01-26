@@ -1,3 +1,4 @@
+
 import habitat
 import os
 import argparse
@@ -6,39 +7,23 @@ import cv2
 import imageio
 import numpy as np
 import time
-from cv_utils.detection_tools import *
 from tqdm import tqdm
+from omegaconf import OmegaConf, open_dict
+
 from constants import *
 from config_utils import hm3d_config
 from gpt4v_planner import GPT4V_Planner
 from policy_agent import Policy_Agent
-from cv_utils.detection_tools import initialize_dino_model
+from cv_utils.detection_tools import initialize_dino_model, openset_detection
 from cv_utils.segmentation_tools import initialize_sam_model
 from habitat.utils.visualizations.maps import colorize_draw_agent_and_fit_to_height
-from omegaconf import OmegaConf, open_dict  # for NumSteps enable
-from place_graph.manager import PlaceManager
-from place_graph.visualizer import GraphVisualizer
-from llm_utils.vertex_client_wrapper import VertexAIClient
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ["MAGNUM_LOG"] = "quiet"
-os.environ["HABITAT_SIM_LOG"] = "quiet"
+# New Imports for Metric-Free System
+from place_graph.circular_memory import CircularMemory, Slot, K_SLOTS
+from llm_utils.tokenizer import extract_tokens_and_description
+from cv_utils.vocab import ALLOWED_VOCAB
 
-MEMORY_DETECT_OBJECTS = [
-    "door",
-    "doorway",
-    "entrance",
-    "gate",
-    "bed",
-    "sofa",
-    "chair",
-    "table",
-    "desk",
-    "plant",
-    "tv",
-    "toilet",
-]
-
+# Constants
 ACTION_STOP = 0
 ACTION_FORWARD = 1
 ACTION_TURN_LEFT = 2
@@ -46,28 +31,12 @@ ACTION_TURN_RIGHT = 3
 ACTION_LOOK_UP = 4
 ACTION_LOOK_DOWN = 5
 
-VLM_UPDATE_INTERVAL = 20
-
 def action_to_nav(action_id):
-    if action_id == ACTION_FORWARD:
-        return "forward"
-    if action_id == ACTION_TURN_LEFT:
-        return "turn_left"
-    if action_id == ACTION_TURN_RIGHT:
-        return "turn_right"
-    if action_id == ACTION_STOP:
-        return "stop"
+    if action_id == ACTION_FORWARD: return "forward"
+    if action_id == ACTION_TURN_LEFT: return "turn_left"
+    if action_id == ACTION_TURN_RIGHT: return "turn_right"
+    if action_id == ACTION_STOP: return "stop"
     return None
-
-def write_metrics(metrics, path="objnav_hm3d.csv"):
-    with open(path, mode="w", newline="") as csv_file:
-        fieldnames = metrics[0].keys()
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(metrics)
-
-def adjust_topdown(metrics):
-    return cv2.cvtColor(colorize_draw_agent_and_fit_to_height(metrics['top_down_map'], 1024), cv2.COLOR_BGR2RGB)
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -75,305 +44,301 @@ def get_args():
     parser.add_argument("--max_episode_steps", type=int, default=500)
     return parser.parse_known_args()[0]
 
-def detect_mask(image, category, detect_model):
-    det_result = openset_detection(image, category, detect_model)
-    if det_result.xyxy.shape[0] > 0:
-        goal_image = image
-        goal_mask_xyxy = det_result.xyxy[np.argmax(det_result.confidence)]
-        goal_mask_x = int((goal_mask_xyxy[0] + goal_mask_xyxy[2]) / 2)
-        goal_mask_y = int((goal_mask_xyxy[1] + goal_mask_xyxy[3]) / 2)
-        goal_mask = np.zeros((goal_image.shape[0], goal_image.shape[1]), np.uint8)
-        goal_mask = cv2.rectangle(
-            goal_mask,
-            (goal_mask_x - 8, goal_mask_y - 8),
-            (goal_mask_x + 8, goal_mask_y + 8),
-            (255, 255, 255),
-            -1,
-        )
-        return True, goal_image, goal_mask
-    return False, [], []
+def write_metrics(metrics, path="objnav_hm3d.csv"):
+    if not metrics: return
+    with open(path, mode="w", newline="") as csv_file:
+        fieldnames = metrics[0].keys()
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics)
 
-def detect_memory_objects(image, detect_model, return_det=False):
-    try:
-        det = openset_detection(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), MEMORY_DETECT_OBJECTS, detect_model)
-    except Exception:
-        return ([], None) if return_det else []
-    detected = []
-    for cls_id, conf in zip(det.class_id, det.confidence):
-        if cls_id is None:
-            continue
-        idx = int(cls_id)
-        if 0 <= idx < len(MEMORY_DETECT_OBJECTS):
-            detected.append({"label": MEMORY_DETECT_OBJECTS[idx], "conf": float(conf)})
-    if return_det:
-        return detected, det
-    return detected
+def adjust_topdown(metrics):
+    if 'top_down_map' in metrics:
+        return cv2.cvtColor(colorize_draw_agent_and_fit_to_height(metrics['top_down_map'], 1024), cv2.COLOR_BGR2RGB)
+    return None
 
-def get_agent_pose(sim):
-    state = sim.get_agent_state()
-    pos = state.position
-    q = state.rotation
-    yaw = -np.arctan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y ** 2 + q.z ** 2))
-    return (float(pos[0]), float(pos[2]), float(yaw))
+def main():
+    args = get_args()
+    habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
+    
+    # Enable NumSteps
+    OmegaConf.set_readonly(habitat_config, False)
+    habitat_config.habitat.environment.max_episode_steps = args.max_episode_steps
+    # Note: Removed explicit NumStepsMeasure injection as it caused OmegaConf validation error.
+    # Assuming habitat env provides 'num_steps' or we count manually.
 
-def update_place_memory(
-    place_manager,
-    sim,
-    semantic_extractor,
-    obs_image,
-    detect_model,
-    action=None,
-    step_count=None,
-    vlm_interval=VLM_UPDATE_INTERVAL,
-    force_vlm=False,
-):
-    vlm_data = None
-    det = None
-    detected_objects = []
+    # Clear tmp directory
+    import shutil
+    if os.path.exists("./tmp"):
+        shutil.rmtree("./tmp")
+    os.makedirs("./tmp", exist_ok=True)
 
-    do_vlm = force_vlm or (step_count is not None and step_count % vlm_interval == 0)
+    habitat_env = habitat.Env(habitat_config)
+    
+    # Models
+    detection_model = initialize_dino_model()
+    segmentation_model = initialize_sam_model()
+    planner = GPT4V_Planner(detection_model, segmentation_model)
+    executor = Policy_Agent(model_path=POLICY_CHECKPOINT)
 
-    if do_vlm and semantic_extractor is not None:
-        try:
-            _, buf = cv2.imencode(".jpg", obs_image[:, :, ::-1])
-            vlm_data = semantic_extractor.analyze_scene(buf.tobytes())
-        except Exception:
-            vlm_data = None
+    evaluation_metrics = []
 
-    if do_vlm and detect_model is not None:
-        detected_objects, det = detect_memory_objects(obs_image, detect_model, return_det=True)
+    for i in tqdm(range(args.eval_episodes)):
+        obs = habitat_env.reset()
+        
+        # --- Episode Initialization ---
+        planner.reset(habitat_env.current_episode.object_category)
+        memory = CircularMemory() # Reset memory
+        
+        # Episode logging setup
+        episode_dir = f"./tmp/trajectory_{i}"
+        os.makedirs(episode_dir, exist_ok=True)
+        
+        fps_writer = imageio.get_writer(f"{episode_dir}/fps.mp4", fps=4)
+        topdown_writer = imageio.get_writer(f"{episode_dir}/metric.mp4", fps=4)
+        
+        episode_video = []  # To store frames for manual append if needed
+        episode_topdowns = []
 
-    pose = get_agent_pose(sim)
-    place_manager.update(pose, vlm_data, detected_objects, action=action)
-    return det
+        # Distance Tracking
+        # 유클리드 누적 이동거리 계측을 위해 env.step 래핑
+        _stats = {
+            "dist_m": 0.0,
+            "prev": np.array(habitat_env.sim.get_agent_state().position, dtype=np.float32),
+        }
+        _orig_step = habitat_env.step
+        
+        def _instrumented_step(action):
+            obs_ = _orig_step(action)
+            cur = np.array(habitat_env.sim.get_agent_state().position, dtype=np.float32)
+            dist = float(np.linalg.norm(cur - _stats["prev"]))
+            _stats["dist_m"] += dist
+            _stats["prev"] = cur
+            return obs_
+        
+        habitat_env.step = _instrumented_step
+        
+        step_count = 0
+        heading_offset = 0  # Baseline: Track Look Up/Down actions
+        event = "EPISODE_START" # Trigger
+        active_attempt = None 
+        
+        # Timing
+        episode_t0 = time.perf_counter()
+        
+        # Helper to record frame
+        def record_frame(obs_rgb, metrics_now=None):
+            if metrics_now is None:
+                metrics_now = habitat_env.get_metrics()
+            
+            # FPS Video
+            fps_writer.append_data(obs_rgb)
+            
+            # Topdown Video
+            td_map = adjust_topdown(metrics_now)
+            if td_map is not None:
+                topdown_writer.append_data(td_map)
 
-def draw_detections_on_frame(frame, det, class_names, color=(0, 255, 0)):
-    if det is None or det.xyxy is None or det.xyxy.shape[0] == 0:
-        return frame
-    out = frame.copy()
-    for box, cls_id, conf in zip(det.xyxy, det.class_id, det.confidence):
-        if cls_id is None:
-            continue
-        idx = int(cls_id)
-        label = class_names[idx] if 0 <= idx < len(class_names) else str(idx)
-        x1, y1, x2, y2 = [int(v) for v in box]
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        text = f"{label} {float(conf):.2f}"
-        cv2.putText(out, text, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-    return out
+        # Record Initial Frame
+        record_frame(obs['rgb'])
 
-args = get_args()
-habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
-print("scene_dataset =", habitat_config.habitat.simulator.scene_dataset)
-print("scenes_dir    =", habitat_config.habitat.dataset.scenes_dir)
-print("data_path     =", habitat_config.habitat.dataset.data_path)
+        # Main Loop
+        while not habitat_env.episode_over:
+            
+            if event in ["EPISODE_START", "REPLAN"]:
+                print(f"[Step {step_count}] Event: {event}")
+                
+                # Baseline: Restore heading before panorama
+                for _ in range(0, abs(heading_offset)):
+                    if habitat_env.episode_over:
+                        break
+                    if heading_offset > 0:
+                        obs = habitat_env.step(ACTION_LOOK_DOWN)  # Undo Look Up
+                        step_count += 1
+                        record_frame(obs['rgb'])
+                        heading_offset -= 1
+                    elif heading_offset < 0:
+                        obs = habitat_env.step(ACTION_LOOK_UP)  # Undo Look Down
+                        step_count += 1
+                        record_frame(obs['rgb'])
+                        heading_offset += 1
+                
+                if habitat_env.episode_over: break
+                
+                # A. Scan 360 & Tokenize
+                pano_images = []
+                current_slots = []
+                
+                # Collect 12 images
+                images_to_collect = []
+                images_to_collect.append(obs['rgb']) # Image 0
+                
+                # Turn 11 times
+                for _ in range(11):
+                    obs = habitat_env.step(ACTION_TURN_RIGHT)
+                    step_count += 1
+                    images_to_collect.append(obs['rgb'])
+                    record_frame(obs['rgb'])
+                    if habitat_env.episode_over: break
+                
+                if habitat_env.episode_over: break
+                
+                pano_images = images_to_collect
+                
+                # Tokenize
+                print("  -> Analyzine Scene (VLM)...")
+                for slot_idx, img in enumerate(pano_images):
+                    data = extract_tokens_and_description(img)
+                    slot_obj = Slot(index=slot_idx, tokens=set(data["tokens"]), description=data["description"])
+                    current_slots.append(slot_obj)
+                
+                # B. Memory Update
+                pid, shift, score, revisit = memory.assign_place(current_slots)
+                
+                # Door Update Logic
+                if active_attempt:
+                     prev_pid = active_attempt["place_id"]
+                     door_id = active_attempt["door_id"]
+                     if door_id is not None:
+                         if pid != prev_pid:
+                             memory.update_door_status(prev_pid, door_id, "scene_changed", pid)
+                             print(f"  -> Door {door_id} SUCCESS: {prev_pid} -> {pid}")
+                         else:
+                             memory.update_door_status(prev_pid, door_id, "stop_no_change")
+                             print(f"  -> Door {door_id} FAILED: Stayed in {pid}")
+                     active_attempt = None
+                
+                memory.manage_doors(pid, current_slots)
+                print(f"  -> Place Assigned: {pid} (Revisit={revisit}, Score={score:.2f})")
+                
+                # C. Build Context & Plan
+                context_text = memory.get_nav_context(habitat_env.current_episode.object_category)
+                
+                direction_image, goal_mask, debug_img, vis_rgb, angle_slot, goal_flag, desc, raw_json = \
+                    planner.make_plan(pano_images, context_text)
+                
+                # Log Decision
+                memory.dc_queue.append({
+                    "place_id": pid,
+                    "angle_slot": angle_slot,
+                    "goal_flag": goal_flag,
+                    "why": desc,
+                    "result": "pending"
+                })
+                
+                # Append Debug Frame to Video (Multiple times to make it visible)
+                for _ in range(4): # 1 second approx
+                    fps_writer.append_data(vis_rgb)
+                    # For topdown, just repeat last map
+                    td_map = adjust_topdown(habitat_env.get_metrics())
+                    if td_map is not None:
+                        topdown_writer.append_data(td_map)
 
-# Enable NumSteps + set max steps
-OmegaConf.set_readonly(habitat_config, False)
-habitat_config.habitat.environment.max_episode_steps = args.max_episode_steps
-try:
-    from habitat.config.default_structured_configs import NumStepsMeasurementConfig
-    with open_dict(habitat_config.habitat.task.measurements):
-        if "num_steps" not in habitat_config.habitat.task.measurements:
-            habitat_config.habitat.task.measurements.num_steps = NumStepsMeasurementConfig()
-except Exception:
-    with open_dict(habitat_config.habitat.task.measurements):
-        if "num_steps" not in habitat_config.habitat.task.measurements:
-            habitat_config.habitat.task.measurements.num_steps = {"type": "NumStepsMeasure"}
-
-habitat_env = habitat.Env(habitat_config)
-detection_model = initialize_dino_model()
-segmentation_model = initialize_sam_model()
-
-nav_planner = GPT4V_Planner(detection_model, segmentation_model)
-nav_executor = Policy_Agent(model_path=POLICY_CHECKPOINT)
-evaluation_metrics = []
-
-# Semantic extractor (Vertex AI tuned model). Constants are in code, not env vars.
-VERTEX_PROJECT_ID = "dogwood-method-480911-p3"
-VERTEX_LOCATION = "us-central1"
-VERTEX_ENDPOINT_ID = "5960655394069020672"
-semantic_extractor = VertexAIClient(
-    project=VERTEX_PROJECT_ID,
-    location=VERTEX_LOCATION,
-    endpoint_id=VERTEX_ENDPOINT_ID,
-)
-
-for i in tqdm(range(args.eval_episodes)):
-    obs = habitat_env.reset()
-    place_manager = PlaceManager()
-    stm_visualizer = GraphVisualizer()
-
-    # 시작 지오데식 거리(최단경로 기준)
-    start_geodesic_m = float(habitat_env.get_metrics()['distance_to_goal'])
-
-    # 유클리드 누적 이동거리 계측을 위해 env.step 래핑
-    _stats = {
-        "dist_m": 0.0,
-        "prev": np.array(habitat_env.sim.get_agent_state().position, dtype=np.float32),
-    }
-    _orig_step = habitat_env.step
-    def _instrumented_step(action):
-        obs_ = _orig_step(action)
-        cur = np.array(habitat_env.sim.get_agent_state().position, dtype=np.float32)
-        _stats["dist_m"] += float(np.linalg.norm(cur - _stats["prev"]))
-        _stats["prev"] = cur
-        return obs_
-    habitat_env.step = _instrumented_step
-
-    dir = "./tmp/trajectory_%d" % i
-    os.makedirs(dir, exist_ok=False)
-    fps_writer = imageio.get_writer("%s/fps.mp4" % dir, fps=4)
-    topdown_writer = imageio.get_writer("%s/metric.mp4" % dir, fps=4)
-    stm_writer = imageio.get_writer("%s/stm.mp4" % dir, fps=4)
-    heading_offset = 0
-
-    nav_planner.reset(habitat_env.current_episode.object_category)
-    episode_images_raw = []
-    episode_video = []
-    episode_topdowns = []
-    episode_stm = []
-    action_step = [0]
-    def record_step(obs_, action=None, force_vlm=False):
-        if action is not None:
-            action_step[0] += 1
-        nav_action = action_to_nav(action) if action is not None else None
-        mem_det = update_place_memory(
-            place_manager,
-            habitat_env.sim,
-            semantic_extractor,
-            obs_['rgb'],
-            detection_model,
-            action=nav_action,
-            step_count=action_step[0],
-            vlm_interval=VLM_UPDATE_INTERVAL,
-            force_vlm=force_vlm,
-        )
-        episode_images_raw.append(obs_['rgb'])
-        episode_video.append(obs_['rgb'].copy())
-        episode_topdowns.append(adjust_topdown(habitat_env.get_metrics()))
-        episode_stm.append(stm_visualizer.draw_map(place_manager))
-        if mem_det is not None:
-            episode_video[-1] = draw_detections_on_frame(
-                episode_video[-1],
-                mem_det,
-                MEMORY_DETECT_OBJECTS,
-                color=(0, 200, 255),
-            )
-    def append_debug_frame(frame, repeat=2):
-        if frame is None:
-            return
-        for _ in range(repeat):
-            episode_video.append(frame.copy())
-    record_step(obs, force_vlm=True)
-
-    # 계산 시간(비디오 I/O 제외) 측정 시작
-    episode_t0 = time.perf_counter()
-
-    # 한 바퀴 관측 후 초기 플랜
-    for _ in range(11):
-        obs = habitat_env.step(3)
-        record_step(obs, action=3)
-    nav_context = place_manager.get_nav_context()
-    goal_image, goal_mask, debug_image, vis_rgb, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
-        episode_images_raw[-12:],
-        context=nav_context,
-    )
-    for j in range(min(11 - goal_rotate, 1 + goal_rotate)):
-        if goal_rotate <= 6:
-            obs = habitat_env.step(3)
-            action = 3
-        else:
-            obs = habitat_env.step(2)
-            action = 2
-        record_step(obs, action=action)
-    append_debug_frame(vis_rgb)
-    nav_executor.reset(goal_image, goal_mask)
-
-    while not habitat_env.episode_over:
-        action, skill_image = nav_executor.step(obs['rgb'], habitat_env.sim.previous_step_collided)
-        if action != 0 or goal_flag:
-            if action == 4:
-                heading_offset += 1
-            elif action == 5:
-                heading_offset -= 1
-            obs = habitat_env.step(action)
-            record_step(obs, action=action)
-        else:
-            if habitat_env.episode_over:
-                break
-            for _ in range(0, abs(heading_offset)):
-                if habitat_env.episode_over:
-                    break
-                if heading_offset > 0:
-                    action_id = 5
-                    obs = habitat_env.step(action_id)
-                    heading_offset -= 1
-                elif heading_offset < 0:
-                    action_id = 4
-                    obs = habitat_env.step(action_id)
+                # D. Valid Door Binding
+                target_slot = current_slots[angle_slot]
+                chosen_door_id = None
+                if target_slot.door_ids:
+                    chosen_door_id = target_slot.door_ids[0]
+                    
+                active_attempt = {
+                    "place_id": pid,
+                    "door_id": chosen_door_id,
+                    "start_scene_type": desc, 
+                }
+                
+                # E. Turn to Target
+                turns = (angle_slot - 11) % 12
+                print(f"  -> Planning Turn: {turns} steps (Target Slot {angle_slot})")
+                for _ in range(turns):
+                    obs = habitat_env.step(ACTION_TURN_RIGHT)
+                    step_count += 1
+                    record_frame(obs['rgb'])
+                    if habitat_env.episode_over: break
+                
+                if habitat_env.episode_over: break
+                
+                # Ensure mask is uint8
+                if goal_mask.dtype == bool:
+                    goal_mask = (goal_mask * 255).astype(np.uint8)
+                
+                executor.reset(direction_image, goal_mask)
+                event = "EXECUTE"
+            
+            elif event == "EXECUTE":
+                action, _, distance_pred = executor.step(obs['rgb'], habitat_env.sim.previous_step_collided)
+                
+                # --- Smart STOP Logic ---
+                # PixelNav says we are close (distance_pred < 0.15 approx 1.5m) AND VLM said this is goal
+                if goal_flag and distance_pred < 0.15:
+                    # Verify with DINO in current view
+                    # Use planner.dino_model (it holds the initialized DINO model)
+                    
+                    target_name = habitat_env.current_episode.object_category
+                    if target_name == 'tv_monitor': target_name = 'tv' # Mapping
+                    
+                    bbox = openset_detection(obs['rgb'], [target_name], planner.dino_model, box_threshold=0.25)
+                    
+                    if len(bbox.xyxy) > 0:
+                        print(f"  -> Smart STOP Triggered! (Dist={distance_pred:.2f}, DINO Found {target_name})")
+                        obs = habitat_env.step(ACTION_STOP)
+                        step_count += 1
+                        record_frame(obs['rgb'])
+                        break
+                
+                # Baseline: Track Look Up/Down actions
+                if action == ACTION_LOOK_UP:
                     heading_offset += 1
-                record_step(obs, action=action_id)
-
-            # 다시 한 바퀴 관측 후 재플랜
-            for _ in range(11):
-                if habitat_env.episode_over:
-                    break
-                obs = habitat_env.step(3)
-                record_step(obs, action=3)
-            nav_context = place_manager.get_nav_context()
-            goal_image, goal_mask, debug_image, vis_rgb, goal_rotate, goal_flag, _scene_desc = nav_planner.make_plan(
-                episode_images_raw[-12:],
-                context=nav_context,
-            )
-            for j in range(min(11 - goal_rotate, goal_rotate + 1)):
-                if habitat_env.episode_over:
-                    break
-                if goal_rotate <= 6:
-                    obs = habitat_env.step(3)
-                    action = 3
+                elif action == ACTION_LOOK_DOWN:
+                    heading_offset -= 1
+                
+                if action == ACTION_STOP:
+                    if not goal_flag: 
+                        event = "REPLAN"
+                    else:
+                        print("  -> Goal Stop Triggered!")
+                        obs = habitat_env.step(ACTION_STOP)  # Send STOP to Habitat!
+                        step_count += 1
+                        record_frame(obs['rgb'])
+                        break
                 else:
-                    obs = habitat_env.step(2)
-                    action = 2
-                record_step(obs, action=action)
-            append_debug_frame(vis_rgb)
-            nav_executor.reset(goal_image, goal_mask)
+                    obs = habitat_env.step(action)
+                    step_count += 1
+                    record_frame(obs['rgb'])
+            
+            else:
+                event = "REPLAN"
 
-    # 계산 시간 측정 종료
-    episode_t1 = time.perf_counter()
-    episode_time_sec = episode_t1 - episode_t0
+        # --- Episode Video Cleanup ---
+        habitat_env.step = _orig_step # Restore step before getting final metrics
+        fps_writer.close()
+        topdown_writer.close()
+        
+        # --- Metrics Logging ---
+        metrics_now = habitat_env.get_metrics()
+        episode_t1 = time.perf_counter()
+        
+        start_geodesic = float(metrics_now.get('distance_to_goal', 0)) # Note: this is final dist, need initial? 
+        # Actually habitat metrics 'distance_to_goal' is current distance.
+        # Ideally we captured start distance at reset. 
+        # But 'spl' calculation handles it internally.
+        # We can just log what we have.
+        
+        evaluation_metrics.append({
+            'episode': i,
+            'object_goal': habitat_env.current_episode.object_category,
+            'success': metrics_now['success'],
+            'spl': metrics_now['spl'],
+            'final_distance_to_goal': metrics_now['distance_to_goal'],
+            'llm_calls': int(planner.llm_call_count),
+            'llm_avg_time_sec': float(np.mean(planner.llm_durations)) if len(planner.llm_durations) > 0 else 0.0,
+            'episode_time_sec': float(episode_t1 - episode_t0),
+            'num_steps': step_count,
+            'total_distance_m': float(_stats['dist_m']),
+            'place_count': len(memory.places),
+        })
+        
+        print(f"Episode {i} Summary: SPL={metrics_now['spl']:.2f}, Places={len(memory.places)}")
+        write_metrics(evaluation_metrics)
 
-    # step 래핑 원복
-    habitat_env.step = _orig_step
-
-    for image in episode_video:
-        fps_writer.append_data(image)
-    for topdown in episode_topdowns:
-        topdown_writer.append_data(topdown)
-    for stm_frame in episode_stm:
-        stm_writer.append_data(stm_frame)
-    fps_writer.close()
-    topdown_writer.close()
-    stm_writer.close()
-
-    # 최종 메트릭 스냅샷
-    metrics_now = habitat_env.get_metrics()
-    final_geodesic_m = float(metrics_now['distance_to_goal'])
-    num_steps_val = int(metrics_now.get('num_steps', 0))
-
-    # ==== 공통 지표만 기록 ====
-    evaluation_metrics.append({
-        'episode': i,
-        'object_goal': habitat_env.current_episode.object_category,
-        'success': metrics_now['success'],
-        'spl': metrics_now['spl'],
-        'start_distance_to_goal': start_geodesic_m,
-        'final_distance_to_goal': final_geodesic_m,
-        'llm_calls': int(nav_planner.llm_call_count),
-        'llm_avg_time_sec': float(np.mean(nav_planner.llm_durations)) if len(nav_planner.llm_durations) > 0 else 0.0,
-        'episode_time_sec': float(episode_time_sec),
-        'num_steps': num_steps_val,
-        'total_distance_m': float(_stats['dist_m']),
-    })
-
-    write_metrics(evaluation_metrics)
+if __name__ == "__main__":
+    main()

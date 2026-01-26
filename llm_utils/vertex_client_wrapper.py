@@ -5,7 +5,7 @@ from vertexai.preview.generative_models import GenerativeModel, Part
 
 DEFAULT_PROJECT_ID = "dogwood-method-480911-p3"
 DEFAULT_LOCATION = "us-central1"
-DEFAULT_ENDPOINT_ID = "5960655394069020672"
+DEFAULT_ENDPOINT_ID = "1254022698292477952"
 
 
 class VertexAIClient:
