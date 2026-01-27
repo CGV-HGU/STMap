@@ -192,20 +192,26 @@ def main():
                     slot_obj = Slot(index=slot_idx, tokens=set(data["tokens"]), description=data["description"])
                     current_slots.append(slot_obj)
                 
-                # B. Memory Update
+                # B. Memory Update & Result Propagation
                 pid, shift, score, revisit = memory.assign_place(current_slots)
                 
-                # Door Update Logic
                 if active_attempt:
                      prev_pid = active_attempt["place_id"]
                      door_id = active_attempt["door_id"]
+                     
+                     # Determine Result
+                     if pid != prev_pid:
+                         res_str = "SUCCESS (Scene Changed)"
+                         res_type = "scene_changed"
+                     else:
+                         res_str = "FAILED (Stayed in same place)"
+                         res_type = "stop_no_change"
+                     
                      if door_id is not None:
-                         if pid != prev_pid:
-                             memory.update_door_status(prev_pid, door_id, "scene_changed", pid)
-                             print(f"  -> Door {door_id} SUCCESS: {prev_pid} -> {pid}")
-                         else:
-                             memory.update_door_status(prev_pid, door_id, "stop_no_change")
-                             print(f"  -> Door {door_id} FAILED: Stayed in {pid}")
+                         memory.update_door_status(prev_pid, door_id, res_type, pid)
+                     
+                     memory.update_last_decision_result(res_str)
+                     print(f"  -> Last Decision Result: {res_str}")
                      active_attempt = None
                 
                 memory.manage_doors(pid, current_slots)

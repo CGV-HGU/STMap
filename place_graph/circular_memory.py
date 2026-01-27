@@ -59,7 +59,13 @@ class Slot:
                 if key in door_memory:
                     visited = door_memory[key].visited
                 
-                display_items.append(f"door(id={did}, visited={visited})")
+                attempts = door_memory[key].attempts if key in door_memory else 0
+                last_result = door_memory[key].last_result if key in door_memory else "none"
+                
+                if attempts > 0 and last_result == "stop_no_change":
+                    display_items.append(f"door(id={did}, visited={visited}, FAILED x{attempts})")
+                else:
+                    display_items.append(f"door(id={did}, visited={visited})")
         elif has_door_token:
             # Fallback if no ID assigned yet (shouldn't happen in finalized scan)
             display_items.append("door(unknown)")
@@ -267,9 +273,17 @@ class CircularMemory:
             info.visited = True
             info.leads_to_place_id = new_place_id
         
+    def update_last_decision_result(self, result_type: str):
+        """
+        Update the 'result' field of the most recent decision in dc_queue.
+        """
+        if self.dc_queue:
+            self.dc_queue[-1]["result"] = result_type
+            
     def get_nav_context(self, target_object: str) -> str:
         """
         Build the prompt text for Planner VLM.
+        Synchronized for 6-slot visual input (Mapping 6 slots to original indices 1, 3, 5, 7, 9, 11).
         """
         if not self.current_place_id:
             return "No location context available."
@@ -280,38 +294,66 @@ class CircularMemory:
         lines.append(f"Target Object: {target_object}")
         lines.append(f"Current Location: {self.current_place_id} (Revisit: {current_scan.is_revisit}, Match Score: {current_scan.match_score:.2f})")
         
-        # Current Slots
-        lines.append("\nCurrent 360 Scan (12 slots):")
-        unvisited_slots = []
-        for slot in current_scan.slots:
+        # --- Current Slots (Synchronized to 6 units) ---
+        lines.append("\n[CURRENT OBSERVATION (Filtered to 6 visual slots)]")
+        lines.append("Note: These indices (0-5) match the 6-grid image provided.")
+        
+        # Mapping: VLM Index (0..5) -> Original Index (1, 3, 5, 7, 9, 11)
+        vlm_mapping = [1, 3, 5, 7, 9, 11]
+        unvisited_vlm_slots = []
+        
+        for vlm_idx, orig_idx in enumerate(vlm_mapping):
+            slot = current_scan.slots[orig_idx]
             content = slot.to_planner_string(self.door_memory, self.current_place_id)
             desc_part = f" - {slot.description}" if slot.description else ""
-            lines.append(f"Slot {slot.index:02d}: {content}{desc_part}")
+            lines.append(f"Slot {vlm_idx}: {content}{desc_part}")
             
-            # Check for unvisited doors in this slot
+            # Check for unvisited/failed doors in this slot
             if slot.door_ids:
-                is_unvisited = False
+                has_active = False
                 for did in slot.door_ids:
                     key = (self.current_place_id, did)
                     if key in self.door_memory and not self.door_memory[key].visited:
-                        is_unvisited = True
+                        has_active = True
                         break
-                if is_unvisited:
-                    unvisited_slots.append(f"Slot {slot.index}")
+                if has_active:
+                    unvisited_vlm_slots.append(f"Slot {vlm_idx}")
 
         # CRITICAL HINT for Exploration
-        if unvisited_slots:
+        if unvisited_vlm_slots:
             lines.append("\n[CRITICAL HINT]")
-            lines.append(f"- 🚪 Unvisited Doors available at: {', '.join(unvisited_slots)}")
-            lines.append("- If goal is not visible, prioritize these slots to EXPLORE NEW AREAS and ESCAPE the current room.")
+            lines.append(f"- 🚪 Unvisited Doors (Exploration Exits) available at: {', '.join(unvisited_vlm_slots)}")
+            lines.append("- If the goal object is not clearly visible, you MUST prioritize these exits to find new rooms.")
         else:
             lines.append("\n[HINT]")
-            lines.append("- No unvisited doors in this view. You may need to revisit a door or look for a hallway.")
+            lines.append("- No unvisited doors in these 6 views. Look for hallways or revisit a door if necessary.")
             
-        # History
+        # --- Decision History (Explicit Success/Failure) ---
         if self.dc_queue:
-            lines.append("\nRecent Decisions (Discovered Context):")
+            lines.append("\n[DECISION HISTORY (Recently discovered context)]")
             for item in self.dc_queue:
-                lines.append(f"- At {item['place_id']}, chose slot {item['angle_slot']} (Goal={item['goal_flag']}) -> Result: {item['result']}")
+                res = item['result'].upper()
+                lines.append(f"- At {item['place_id']}, chose Slot {item['angle_slot']} -> Result: {res}")
+
+        # --- Topological Graph (Explicit Adjacency) ---
+        lines.append("\n[SEMANTIC TOPOLOGICAL GRAPH (Memory)]")
+        adj_lines = []
+        for (pid, did), info in self.door_memory.items():
+            status = "VISITED (leads to " + info.leads_to_place_id + ")" if info.visited else "UNVISITED"
+            fail_warn = f" [WARNING: FAILED x{info.attempts}]" if info.attempts > 0 and not info.visited else ""
+            adj_lines.append(f"- {pid} --[Exit {did}]--> {status}{fail_warn}")
+            
+        if adj_lines:
+            lines.extend(adj_lines)
+        else:
+            lines.append("- No topological connections recorded yet.")
+
+        # --- Loop Detection ---
+        if len(self.dc_queue) >= 3:
+            recent_places = [d["place_id"] for d in list(self.dc_queue)[-3:]]
+            if recent_places[0] == recent_places[2] and recent_places[0] != recent_places[1]:
+                lines.append("\n[WARNING: ABABA LOOP DETECTED]")
+                lines.append(f"- You are oscillating between {recent_places[0]} and {recent_places[1]}.")
+                lines.append("- ACTION: You MUST choose a different exit slot to break this cycle.")
                 
         return "\n".join(lines)
