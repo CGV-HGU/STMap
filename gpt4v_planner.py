@@ -16,28 +16,27 @@ You do NOT use coordinates or distance values.
 
 **Input:**
 1. **Visual:** A 6-slot panoramic view (2 rows x 3 columns).
-   - Top Row: Slot 0 (Left), Slot 1 (Center), Slot 2 (Right).
-   - Bottom Row: Slot 3 (Left), Slot 4 (Center), Slot 5 (Right).
+   - Top Row (left-to-right): Slot 0, Slot 1, Slot 2.
+   - Bottom Row (left-to-right): Slot 3, Slot 4, Slot 5.
    - These indices (0-5) are your ONLY valid output for `angle_slot`.
 
-2. **Context:** A semantic summary mapped 1:1 to your visual slots, plus topological history.
+2. **Context:** A semantic summary mapped 1:1 to your visual slots, plus topological categorization of exits.
 
 **Output:**
 A JSON object only.
-
 {{
-  "thought": "Analysis of visual targets, history (SUCCESS/FAILED), and topological graph.",
+  "thought": "Directly compare target visibility, categorize exits (NEW vs SOURCE vs VISITED), and explain your choice based on navigation rules.",
   "angle_slot": <int 0..5>, 
   "goal_flag": <bool>,
   "why": "Brief explanation"
 }}
 
-**Strict Rules:**
-1. **Goal Finding:** If you see the Target Object, set `goal_flag=true` and `angle_slot` to its slot (0-5).
-2. **Exploration:** If the target is NOT visible, choose a slot that leads to an "UNVISITED" door or hallway in the topological graph. 
-3. **Failure Avoidance:** NEVER choose a slot labeled `FAILED` in the history/context unless NO other options exist.
-4. **Anti-Oscillation:** NEVER go back to a door marked `VISITED` unless you are backtracking from a dead-end.
-5. **Loop Breaking:** If you see `[WARNING: ABABA LOOP DETECTED]`, you MUST pick a direction you HAVEN'T chosen recently.
+**Navigation Rules (Strict Priority):**
+1. **Goal Finding:** If the Target Object is clearly visible in any slot, set `goal_flag=true` and `angle_slot` to its slot.
+2. **Exploration:** If the target is NOT visible, identify slots labeled `[NEW EXPLORATION]`. These are your HIGHEST priority exits. Pick one to enter a new space.
+3. **Oscillation Prevention:** Do NOT go back through a slot labeled `[SOURCE/BACKTRACK]` unless YOU ARE STUCK (all other exits are VISITED or FAILED). Backtracking leads to infinite loops.
+4. **Loop Breaking:** If you see a `[🚨 WARNING: OSCILLATION DETECTED]`, you MUST NOT pick the most recent direction. Force an exploration into a new or different previously explored door.
+5. **Failures:** AVOID slots labeled `(FAILED xN)` unless they are the only remaining way forward.
 
 **Context:**
 {context}
@@ -163,7 +162,7 @@ class GPT4V_Planner:
                 thickness=2,
             )
 
-        return direction_image, debug_mask, debug_image, vis_rgb, direction_slot, goal_flag, desc, raw_json
+        return direction_image, debug_mask, debug_image, vis_rgb, vlm_slot, direction_slot, goal_flag, desc, raw_json
 
 
     def query_gpt4v(self, pano_images, context_text):
@@ -220,10 +219,41 @@ class GPT4V_Planner:
         # Simple detection viz helper
         out = image.copy()
         if det.xyxy is None: return out
-        for box, cls, conf in zip(det.xyxy, det.class_id, det.confidence):
+        
+        # Use detection's class names if not provided
+        if class_names is None and hasattr(det, 'class_names'):
+            class_names = det.class_names
+            
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        for i, (box, cls, conf) in enumerate(zip(det.xyxy, det.class_id, det.confidence)):
             c = color
+            # If goal_idx matches, use Red, otherwise Green (or passed color)
+            # Logic in caller seems to pass Green(0,255,0) by default
             if goal_idx != -1 and int(cls) == int(goal_idx):
-                c = (0, 0, 255)
+                c = (0, 0, 255) # Red for target
+                
             x1, y1, x2, y2 = map(int, box)
             cv2.rectangle(out, (x1, y1), (x2, y2), c, 2)
+            
+            # Label
+            label = ""
+            if class_names is not None and int(cls) < len(class_names):
+                label = f"{class_names[int(cls)]}"
+            else:
+                label = f"id:{int(cls)}"
+            
+            label += f" {conf:.2f}"
+            
+            # Draw Label
+            (tw, th), _ = cv2.getTextSize(label, font, 0.5, 1)
+            cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), c, -1)
+            cv2.putText(
+                out, label,
+                (x1 + 2, y1 - 4),
+                font, 0.5,
+                (255, 255, 255), 1,
+                cv2.LINE_AA,
+            )
+            
         return out

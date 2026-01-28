@@ -10,25 +10,25 @@ from cv_utils.vocab import normalize_token, ALLOWED_VOCAB
 
 # System prompt for the Tokenizer VLM
 TOKENIZER_SYSTEM_PROMPT = """
-You are a robotic vision system. Your job is to analyze a partial view (slice) of a room and list the visible objects from a fixed vocabulary.
-You must also provide a very brief one-sentence visual description of the scene slice.
+You are a robotic vision system. Your job is to analyze a partial view (slice) of a room and identify both common objects and unique landmarks.
 
-Input: An image (a 30-degree slice of the panoramic view).
+Input: An image (a 60-degree slice of the panoramic view).
 Output: A strict JSON object.
 
-Allowed Vocabulary:
+Allowed Vocabulary (for "tokens"):
 {allowed_vocab}
 
 Rules:
-1. Detect ONLY objects visible in the image.
-2. Use ONLY the exact words from the allowed vocabulary. If an object is a synonym (e.g., 'couch'), map it mentally to the vocabulary ('sofa') but output the vocabulary word.
-3. If 'door' or 'doorway' is visible, it is CRITICAL to list 'door'.
-4. Do NOT hallucinate objects not present.
-5. 'description' should describe lighting, colors, or unique visual features (e.g., "dark corner with a red sofa").
+1. **Tokens**: List common objects using ONLY the allowed vocabulary.
+2. **Landmarks**: List 1-3 UNIQUE visual features that distinguish this specific area (e.g., "red_striped_sofa", "circular_mirror", "tall_blue_vase"). Be specific about colors, materials, or shapes.
+3. **Hierarchy**: If something is a landmark, it can ALSO be in the tokens (e.g., tokens: ["sofa"], landmarks: ["red_striped_sofa"]).
+4. **Description**: Provide a brief one-sentence visual summary highlighting environmental conditions (lighting, clutter).
+5. Do NOT hallucinate. Only list what is clearly visible.
 
 JSON Format:
 {{
   "tokens": ["object1", "object2", ...],
+  "landmarks": ["unique_feature1", "unique_feature2", ...],
   "description": "Short visual description."
 }}
 """
@@ -77,20 +77,21 @@ def extract_tokens_and_description(image, retry=2):
             
             # Post-processing / Validation
             tokens = data.get("tokens", [])
+            landmarks = data.get("landmarks", [])
             description = data.get("description", "")
             
-            # Normalize and filter
+            # Normalize and filter tokens
             valid_tokens = []
             for t in tokens:
                 norm = normalize_token(t)
                 if norm:
                     valid_tokens.append(norm)
             
-            # Remove duplicates while preserving order? No, set is fine for tokens.
             valid_tokens = sorted(list(set(valid_tokens)))
             
             return {
                 "tokens": valid_tokens,
+                "landmarks": [str(l).lower().strip() for l in landmarks],
                 "description": description
             }
             

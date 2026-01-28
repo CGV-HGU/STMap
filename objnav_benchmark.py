@@ -185,11 +185,18 @@ def main():
                 
                 pano_images = images_to_collect
                 
-                # Tokenize
+                # Tokenize (Optimized: 6 slots instead of 12)
                 print("  -> Analyzine Scene (VLM)...")
-                for slot_idx, img in enumerate(pano_images):
+                vlm_mapping = [1, 3, 5, 7, 9, 11]
+                for vlm_idx, img_idx in enumerate(vlm_mapping):
+                    img = pano_images[img_idx]
                     data = extract_tokens_and_description(img)
-                    slot_obj = Slot(index=slot_idx, tokens=set(data["tokens"]), description=data["description"])
+                    slot_obj = Slot(
+                        index=vlm_idx, 
+                        tokens=set(data["tokens"]), 
+                        landmarks=set(data.get("landmarks", [])),
+                        description=data["description"]
+                    )
                     current_slots.append(slot_obj)
                 
                 # B. Memory Update & Result Propagation
@@ -220,13 +227,13 @@ def main():
                 # C. Build Context & Plan
                 context_text = memory.get_nav_context(habitat_env.current_episode.object_category)
                 
-                direction_image, goal_mask, debug_img, vis_rgb, angle_slot, goal_flag, desc, raw_json = \
+                direction_image, goal_mask, debug_img, vis_rgb, vlm_slot, direction_slot, goal_flag, desc, raw_json = \
                     planner.make_plan(pano_images, context_text)
                 
                 # Log Decision
                 memory.dc_queue.append({
                     "place_id": pid,
-                    "angle_slot": angle_slot,
+                    "angle_slot": vlm_slot,
                     "goal_flag": goal_flag,
                     "why": desc,
                     "result": "pending"
@@ -241,7 +248,7 @@ def main():
                         topdown_writer.append_data(td_map)
 
                 # D. Valid Door Binding
-                target_slot = current_slots[angle_slot]
+                target_slot = current_slots[vlm_slot]
                 chosen_door_id = None
                 if target_slot.door_ids:
                     chosen_door_id = target_slot.door_ids[0]
@@ -253,8 +260,8 @@ def main():
                 }
                 
                 # E. Turn to Target
-                turns = (angle_slot - 11) % 12
-                print(f"  -> Planning Turn: {turns} steps (Target Slot {angle_slot})")
+                turns = (direction_slot - 11) % 12
+                print(f"  -> Planning Turn: {turns} steps (Target Slot {direction_slot})")
                 for _ in range(turns):
                     obs = habitat_env.step(ACTION_TURN_RIGHT)
                     step_count += 1

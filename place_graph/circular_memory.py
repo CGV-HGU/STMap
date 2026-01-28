@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import List, Set, Dict, Tuple, Optional
 
 # Constants
-K_SLOTS = 12  # 360 degrees / 30 degrees = 12 slots
+K_SLOTS = 6  # Optimized for Scene VLM (odd-indexed slots: 1, 3, 5, 7, 9, 11)
 
 @dataclass
 class DoorInfo:
@@ -16,7 +16,7 @@ class DoorInfo:
     """
     door_id: int
     place_id: str  # The place this door belongs to
-    slot_index: int # The slot index in the circular list (0..11)
+    slot_index: int # The slot index in the circular list (0..5)
     visited: bool = False
     attempts: int = 0
     leads_to_place_id: Optional[str] = None
@@ -25,10 +25,11 @@ class DoorInfo:
 @dataclass
 class Slot:
     """
-    A single angular slot (30-degree sector).
+    A single angular slot (60-degree sector in memory, mapped from 30-degree slices).
     """
     index: int
     tokens: Set[str] # Valid object tokens
+    landmarks: Set[str] = field(default_factory=set) # Unique visual markers
     description: str = "" # VLM description for Planner context
     
     # Embedded door info (for the Planner to see)
@@ -75,11 +76,11 @@ class Slot:
 @dataclass
 class Scan:
     """
-    One 360-degree panoramic observation event.
+    One 360-degree panoramic observation event (6 slots).
     """
     scan_id: str
     place_id: str
-    slots: List[Slot]  # Fixed length K=12
+    slots: List[Slot]  # Fixed length K=6
     timestamp: float
     
     # Matching info
@@ -100,6 +101,9 @@ class CircularMemory:
         self.current_place_id: Optional[str] = None
         self.next_place_idx = 0
         self.next_door_idx = 0 # Global or per-place? Let's do per-place or global unique. Global is easier for debugging.
+        
+        # Oscillation Prevention: Tracking where we came from
+        self.source_door_key: Optional[Tuple[str, int]] = None # (prev_place_id, prev_door_id) that led here
 
     def _get_jaccard(self, set_a: Set[str], set_b: Set[str]) -> float:
         """Compute Jaccard similarity between two token sets."""
@@ -108,6 +112,27 @@ class CircularMemory:
         intersection = len(set_a & set_b)
         union = len(set_a | set_b)
         return intersection / union if union > 0 else 0.0
+
+    def _get_weighted_similarity(self, slot_a: Slot, slot_b: Slot) -> Tuple[float, float]:
+        """
+        Compute similarity and weight for two slots.
+        Slots with landmarks or tokens carry more 'information weight'.
+        """
+        token_sim = self._get_jaccard(slot_a.tokens, slot_b.tokens)
+        landmark_sim = self._get_jaccard(slot_a.landmarks, slot_b.landmarks)
+        
+        # 1. Determine Weight based on information content
+        if slot_a.landmarks or slot_b.landmarks:
+            weight = 5.0  # Landmarks are extremely unique
+            score = (0.2 * token_sim) + (0.8 * landmark_sim)
+        elif slot_a.tokens or slot_b.tokens:
+            weight = 1.0  # Common objects are standard landmarks
+            score = token_sim
+        else:
+            weight = 0.1  # Empty spaces (walls/floors) provide very little uniqueness
+            score = 1.0   # But they match each other perfectly
+            
+        return score, weight
 
     def get_best_shift(self, scan_a: List[Slot], scan_b: List[Slot]) -> Tuple[int, float]:
         """
@@ -119,22 +144,16 @@ class CircularMemory:
         
         # For each possible shift
         for shift in range(K_SLOTS):
-            total_sim = 0.0
+            total_weighted_score = 0.0
+            total_weight = 0.0
             
             for i in range(K_SLOTS):
-                # A[i] vs B[(i + shift) % K]
-                set_a = scan_a[i].tokens
-                
-                # Careful: We want to match visual features. 
-                # Door tokens are visual features too ("door"), so we perform match on raw tokens.
-                # Attributes like ID/visited are not part of visual matching.
-                
                 b_idx = (i + shift) % K_SLOTS
-                set_b = scan_b[b_idx].tokens
-                
-                total_sim += self._get_jaccard(set_a, set_b)
+                score, weight = self._get_weighted_similarity(scan_a[i], scan_b[b_idx])
+                total_weighted_score += (score * weight)
+                total_weight += weight
             
-            avg_score = total_sim / K_SLOTS
+            avg_score = total_weighted_score / total_weight if total_weight > 0 else 0.0
             if avg_score > best_score:
                 best_score = avg_score
                 best_shift = shift
@@ -256,7 +275,7 @@ class CircularMemory:
                     )
                     slot.door_ids.append(new_did)
     
-    def update_door_status(self, place_id: int, door_id: int, result_type: str, new_place_id: str = None):
+    def update_door_status(self, place_id: str, door_id: int, result_type: str, new_place_id: str = None):
         """
         Called after execution to update visited/result status.
         result_type: "scene_changed", "stop_no_change", etc.
@@ -272,6 +291,8 @@ class CircularMemory:
         if result_type == "scene_changed":
             info.visited = True
             info.leads_to_place_id = new_place_id
+            # Record this as the source door for the new place
+            self.source_door_key = key
         
     def update_last_decision_result(self, result_type: str):
         """
@@ -282,8 +303,7 @@ class CircularMemory:
             
     def get_nav_context(self, target_object: str) -> str:
         """
-        Build the prompt text for Planner VLM.
-        Synchronized for 6-slot visual input (Mapping 6 slots to original indices 1, 3, 5, 7, 9, 11).
+        Build the prompt text for Planner VLM with explicit topological categorization.
         """
         if not self.current_place_id:
             return "No location context available."
@@ -294,66 +314,82 @@ class CircularMemory:
         lines.append(f"Target Object: {target_object}")
         lines.append(f"Current Location: {self.current_place_id} (Revisit: {current_scan.is_revisit}, Match Score: {current_scan.match_score:.2f})")
         
-        # --- Current Slots (Synchronized to 6 units) ---
-        lines.append("\n[CURRENT OBSERVATION (Filtered to 6 visual slots)]")
+        # --- Current Slots (6 units) ---
+        lines.append("\n[CURRENT OBSERVATION (6 visual slots)]")
         lines.append("Note: These indices (0-5) match the 6-grid image provided.")
         
-        # Mapping: VLM Index (0..5) -> Original Index (1, 3, 5, 7, 9, 11)
-        vlm_mapping = [1, 3, 5, 7, 9, 11]
         unvisited_vlm_slots = []
+        source_vlm_slot = None
         
-        for vlm_idx, orig_idx in enumerate(vlm_mapping):
-            slot = current_scan.slots[orig_idx]
-            content = slot.to_planner_string(self.door_memory, self.current_place_id)
-            desc_part = f" - {slot.description}" if slot.description else ""
-            lines.append(f"Slot {vlm_idx}: {content}{desc_part}")
+        # Categorize doors for the Planner
+        for vlm_idx in range(K_SLOTS):
+            slot = current_scan.slots[vlm_idx]
             
-            # Check for unvisited/failed doors in this slot
+            door_labels = []
             if slot.door_ids:
-                has_active = False
                 for did in slot.door_ids:
                     key = (self.current_place_id, did)
-                    if key in self.door_memory and not self.door_memory[key].visited:
-                        has_active = True
-                        break
-                if has_active:
-                    unvisited_vlm_slots.append(f"Slot {vlm_idx}")
+                    info = self.door_memory.get(key)
+                    if not info: continue
+                    
+                    # 1. Check if this is the SOURCE (Where we just came from)
+                    is_source = False
+                    if self.source_door_key:
+                        prev_pid, prev_did = self.source_door_key
+                        # If this door leads back to prev_pid, it's a return path
+                        if info.leads_to_place_id == prev_pid:
+                            is_source = True
+                    
+                    label = f"DoorID:{did}"
+                    if is_source:
+                        label += " [SOURCE/BACKTRACK]"
+                        source_vlm_slot = vlm_idx
+                    elif not info.visited:
+                        label += " [NEW EXPLORATION]"
+                        unvisited_vlm_slots.append(vlm_idx)
+                    else:
+                        label += f" [EXPLORED - leads to {info.leads_to_place_id}]"
+                        
+                    if info.attempts > 0 and not info.visited:
+                        label += f" (FAILED x{info.attempts})"
+                    
+                    door_labels.append(label)
 
-        # CRITICAL HINT for Exploration
+            content = slot.to_planner_string(self.door_memory, self.current_place_id)
+            # Remove the generic door format from to_planner_string and use our enhanced labels
+            if door_labels:
+                # Basic tokens without the generic 'door' tags to avoid clutter
+                base_tokens = [t for t in slot.tokens if t != "door"]
+                content = f"[{', '.join(base_tokens + door_labels)}]"
+
+            landmark_part = f" (Landmarks: {', '.join(slot.landmarks)})" if slot.landmarks else ""
+            desc_part = f" - {slot.description}" if slot.description else ""
+            lines.append(f"Slot {vlm_idx}: {content}{landmark_part}{desc_part}")
+
+        # CRITICAL TOPOLOGICAL ADVICE
+        lines.append("\n[NAVIGATION STRATEGY & TOPOLOGY]")
         if unvisited_vlm_slots:
-            lines.append("\n[CRITICAL HINT]")
-            lines.append(f"- 🚪 Unvisited Doors (Exploration Exits) available at: {', '.join(unvisited_vlm_slots)}")
-            lines.append("- If the goal object is not clearly visible, you MUST prioritize these exits to find new rooms.")
-        else:
-            lines.append("\n[HINT]")
-            lines.append("- No unvisited doors in these 6 views. Look for hallways or revisit a door if necessary.")
-            
-        # --- Decision History (Explicit Success/Failure) ---
+            unique_unvisited = sorted(list(set(unvisited_vlm_slots)))
+            lines.append(f"- 🚪 ACTION: Found UNVISITED doors at Slot(s): {', '.join(map(str, unique_unvisited))}.")
+            lines.append("- If you don't see the target object nearby, prioritize these NEW exits to expand the map.")
+        
+        if source_vlm_slot is not None:
+            lines.append(f"- 🔙 AVOID: Slot {source_vlm_slot} is the path you just came from ({self.source_door_key[0]}).")
+            lines.append("  Do NOT go back through this door immediately unless you are stuck or have finished searching this room.")
+
+        # --- Decision History ---
         if self.dc_queue:
-            lines.append("\n[DECISION HISTORY (Recently discovered context)]")
-            for item in self.dc_queue:
+            lines.append("\n[DECISION HISTORY]")
+            for item in list(self.dc_queue)[-3:]:
                 res = item['result'].upper()
                 lines.append(f"- At {item['place_id']}, chose Slot {item['angle_slot']} -> Result: {res}")
-
-        # --- Topological Graph (Explicit Adjacency) ---
-        lines.append("\n[SEMANTIC TOPOLOGICAL GRAPH (Memory)]")
-        adj_lines = []
-        for (pid, did), info in self.door_memory.items():
-            status = "VISITED (leads to " + info.leads_to_place_id + ")" if info.visited else "UNVISITED"
-            fail_warn = f" [WARNING: FAILED x{info.attempts}]" if info.attempts > 0 and not info.visited else ""
-            adj_lines.append(f"- {pid} --[Exit {did}]--> {status}{fail_warn}")
-            
-        if adj_lines:
-            lines.extend(adj_lines)
-        else:
-            lines.append("- No topological connections recorded yet.")
 
         # --- Loop Detection ---
         if len(self.dc_queue) >= 3:
             recent_places = [d["place_id"] for d in list(self.dc_queue)[-3:]]
             if recent_places[0] == recent_places[2] and recent_places[0] != recent_places[1]:
-                lines.append("\n[WARNING: ABABA LOOP DETECTED]")
-                lines.append(f"- You are oscillating between {recent_places[0]} and {recent_places[1]}.")
-                lines.append("- ACTION: You MUST choose a different exit slot to break this cycle.")
+                lines.append("\n[🚨 WARNING: OSCILLATION DETECTED]")
+                lines.append(f"- You are ping-ponging between {recent_places[0]} and {recent_places[1]}.")
+                lines.append("- STOP this cycle. Choose a [NEW EXPLORATION] slot or a different explored door.")
                 
         return "\n".join(lines)
