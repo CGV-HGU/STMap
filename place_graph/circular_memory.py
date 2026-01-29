@@ -160,7 +160,7 @@ class CircularMemory:
                 
         return best_shift, best_score
 
-    def assign_place(self, current_slots: List[Slot], threshold: float = 0.35) -> Tuple[str, int, float, bool]:
+    def assign_place(self, current_slots: List[Slot], threshold: float = 0.25) -> Tuple[str, int, float, bool]:
         """
         Match current scan against PlaceDB.
         Returns: (place_id, shift, score, is_revisit)
@@ -294,25 +294,197 @@ class CircularMemory:
             # Record this as the source door for the new place
             self.source_door_key = key
         
+            
+    def get_graph_summary(self) -> str:
+        """
+        Generate a concise text summary of the known graph topology.
+        Format:
+        Place A (Bedroom): Connected to Place B
+        Place B (Hallway): Connected to Place A, Place C
+        ...
+        """
+        if not self.places:
+            return "Map is empty."
+            
+        summary_lines = []
+        
+        # Build adjacency list from door_memory
+        adj = {}
+        for (pid, did), info in self.door_memory.items():
+            if info.visited and info.leads_to_place_id:
+                if pid not in adj: adj[pid] = set()
+                adj[pid].add(info.leads_to_place_id)
+                
+                # Assume undirected for visualization? Or directed?
+                # Doors are directed edges. 
+                # But physically, if A->B via door 1, usually B->A via some door.
+        
+        # We only list places that have outgoing connections or are the current place
+        relevant_places = set(adj.keys()) | {self.current_place_id} if self.current_place_id else set()
+        
+        for pid in sorted(list(relevant_places)):
+            neighbors = sorted(list(adj.get(pid, [])))
+            
+            # Add semantic label if available (from first slot description or similar? tricky)
+            # For now just use ID.
+            
+            line = f"- {pid}"
+            if pid == self.current_place_id:
+                line += " (CURRENT)"
+            
+            if neighbors:
+                line += f" is connected to: {', '.join(neighbors)}"
+            else:
+                line += " has no explored exits yet."
+            
+            summary_lines.append(line)
+            
+        return "\n".join(summary_lines)
+
+    def get_forbidden_slots(self) -> List[int]:
+        """
+        Detect cycles and return a list of slot indices that should be STRICTLY avoided.
+        Logic:
+        1. If we are in Place A, and we came from Place B.
+        2. If going to Place C would complete a cycle A->..->C->..->A.
+        
+        Actually, simpler logic for 'Oscillation Prevention':
+        If we recently visited Place X, do not go back to Place X immediately unless forced.
+        
+        Refined Logic (Graph Cycle):
+        - Perform BFS/DFS to see if a door leads to a place we visited in the current 'segment'.
+        - But we don't know where a CLOSED door leads.
+        - We only know where OPEN doors lead.
+        
+        So, 'Forbidden' applies to:
+        1. [Oscillation] The door leading back to 'prev_place_id' IF we have other options.
+           (Already handled by prompt advice, but we want STRICT masking).
+        2. [Loop] If we are at A, and door D leads to B, and B is already in our recent history (e.g. A->C->B->A), 
+           then taking D is a cycle.
+           
+        Let's implement a 'Recent History' based ban.
+        """
+        forbidden = []
+        if not self.current_place_id:
+            return []
+            
+        # 1. Backtrack Ban (Oscillation)
+        # If we have [NEW EXPLORATION] slots, strictly ban the [SOURCE] slot to force exploration.
+        has_new_exploration = False
+        current_scan = self.places[self.current_place_id][-1]
+        for slot in current_scan.slots:
+            for did in slot.door_ids:
+                info = self.door_memory.get((self.current_place_id, did))
+                if info and not info.visited and info.attempts == 0:
+                     has_new_exploration = True
+        
+        if has_new_exploration and self.source_door_key:
+             # Find which slot contains the source door
+             prev_pid, prev_did = self.source_door_key
+             # We need to find the slot in CURRENT place that leads to prev_pid
+             # Wait, source_door_key is (prev_place, prev_door). 
+             # We need the door in CURRENT place that leads to prev_place.
+             
+             # Search door memory for leads_to_place_id == prev_pid?
+             # Or rely on 'leads_to' being set?
+             # Usually, when we traverse A->B, we set A.door.leads_to = B.
+             # We DO NOT automatically set B.door.leads_to = A.
+             
+             # So we might not know which door leads back, unless we track 'entry_door' for the current place.
+             # Let's rely on the 'manage_doors' or logic that sets source_door_key.
+             # Actually, we don't track 'entry_door_id' for the current place in this class.
+             pass 
+
+        # 2. Cycle Detection
+        # Traverse decision queue to find recently visited places
+        # If a door leads to a place in dc_queue[-3:], ban it.
+        recent_places = [d['place_id'] for d in self.dc_queue]
+        
+        for vlm_idx, slot in enumerate(current_scan.slots):
+             for did in slot.door_ids:
+                 info = self.door_memory.get((self.current_place_id, did))
+                 if info and info.visited and info.leads_to_place_id:
+                     if info.leads_to_place_id in recent_places:
+                         forbidden.append(vlm_idx)
+                         
+        return sorted(list(set(forbidden)))
+
+    def get_discouraged_slots(self) -> List[int]:
+        """
+        Detect cycles and return a list of slot indices that should be AVOIDED if possible.
+        Renamed from 'forbidden' to 'discouraged' to reflect softer constraints.
+        """
+        # Re-use logic for now, but semantically softer.
+        return self._detect_potential_cycles()
+
+    def _detect_potential_cycles(self) -> List[int]:
+        forbidden = []
+        if not self.current_place_id:
+            return []
+            
+        # 1. Backtrack Discouragement
+        # If we have [NEW EXPLORATION] slots, discourage the [SOURCE] slot.
+        has_new_exploration = False
+        current_scan = self.places[self.current_place_id][-1]
+        for slot in current_scan.slots:
+            for did in slot.door_ids:
+                info = self.door_memory.get((self.current_place_id, did))
+                if info and not info.visited and info.attempts == 0:
+                     has_new_exploration = True
+        
+        if has_new_exploration and self.source_door_key:
+             # Just discouragement, relying on prompt advice. 
+             # We won't explicitly add it to this list unless we want to emphasize it in [DISCOURAGED SLOTS].
+             # Let's add it to emphasize.
+             prev_pid, prev_did = self.source_door_key
+             # Logic to find which local slot leads to prev_pid is tricky without entry_door mapping.
+             # Check leads_to_place_id
+             for vlm_idx, slot in enumerate(current_scan.slots):
+                 for did in slot.door_ids:
+                      info = self.door_memory.get((self.current_place_id, did))
+                      if info and info.leads_to_place_id == prev_pid:
+                           forbidden.append(vlm_idx)
+
+        # 2. Cycle Detection (Strict Repetition)
+        # Only discourage if it leads to a place visited in the last 3 steps (ping-pong prevention).
+        recent_places = [d['place_id'] for d in self.dc_queue][-3:]
+        
+        for vlm_idx, slot in enumerate(current_scan.slots):
+             for did in slot.door_ids:
+                 info = self.door_memory.get((self.current_place_id, did))
+                 if info and info.visited and info.leads_to_place_id:
+                     if info.leads_to_place_id in recent_places:
+                         forbidden.append(vlm_idx)
+                         
+        return sorted(list(set(forbidden)))
+
     def update_last_decision_result(self, result_type: str):
+
         """
         Update the 'result' field of the most recent decision in dc_queue.
         """
         if self.dc_queue:
             self.dc_queue[-1]["result"] = result_type
             
-    def get_nav_context(self, target_object: str) -> str:
+    def get_nav_context(self, target_object: str) -> Tuple[str, List[int]]:
         """
         Build the prompt text for Planner VLM with explicit topological categorization.
+        Returns: (context_text, forbidden_slots)
         """
         if not self.current_place_id:
-            return "No location context available."
+            return "No location context available.", []
+
             
         current_scan = self.places[self.current_place_id][-1]
         
         lines = []
         lines.append(f"Target Object: {target_object}")
         lines.append(f"Current Location: {self.current_place_id} (Revisit: {current_scan.is_revisit}, Match Score: {current_scan.match_score:.2f})")
+        
+        # --- Global Graph Summary ---
+        lines.append("\n[GLOBAL MAP SUMMARY]")
+        lines.append(self.get_graph_summary())
+
         
         # --- Current Slots (6 units) ---
         lines.append("\n[CURRENT OBSERVATION (6 visual slots)]")
@@ -392,4 +564,5 @@ class CircularMemory:
                 lines.append(f"- You are ping-ponging between {recent_places[0]} and {recent_places[1]}.")
                 lines.append("- STOP this cycle. Choose a [NEW EXPLORATION] slot or a different explored door.")
                 
-        return "\n".join(lines)
+        return "\n".join(lines), self.get_discouraged_slots()
+

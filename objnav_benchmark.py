@@ -225,10 +225,10 @@ def main():
                 print(f"  -> Place Assigned: {pid} (Revisit={revisit}, Score={score:.2f})")
                 
                 # C. Build Context & Plan
-                context_text = memory.get_nav_context(habitat_env.current_episode.object_category)
+                context_text, discouraged_slots = memory.get_nav_context(habitat_env.current_episode.object_category)
                 
                 direction_image, goal_mask, debug_img, vis_rgb, vlm_slot, direction_slot, goal_flag, desc, raw_json = \
-                    planner.make_plan(pano_images, context_text)
+                    planner.make_plan(pano_images, context_text, discouraged_slots)
                 
                 # Log Decision
                 memory.dc_queue.append({

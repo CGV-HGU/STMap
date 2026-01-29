@@ -20,12 +20,18 @@ You do NOT use coordinates or distance values.
    - Bottom Row (left-to-right): Slot 3, Slot 4, Slot 5.
    - These indices (0-5) are your ONLY valid output for `angle_slot`.
 
-2. **Context:** A semantic summary mapped 1:1 to your visual slots, plus topological categorization of exits.
+2. **Context:** 
+   - [CURRENT OBSERVATION]: What you see now.
+   - [GLOBAL MAP SUMMARY]: How the world is connected (Topological Map). Use this to understand where you are relative to explored areas.
+   - [DISCOURAGED SLOTS]: Slots that lead to IMMEDIATE LOOPS. Avoid these unless necessary.
 
 **Output:**
 A JSON object only.
 {{
-  "thought": "Directly compare target visibility, categorize exits (NEW vs SOURCE vs VISITED), and explain your choice based on navigation rules.",
+  "observation_summary": "Assume slot 0 is Bedroom, Slot 1 is hallway...",
+  "map_analysis": "I am at Place 2. Place 1 is the previous hallway...",
+  "loop_check": "Slot 2 leads back to Place 1 (Source). Slot 5 is discouraged...",
+  "thought": "Directly compare target visibility, choose NEW path over VISITED path...",
   "angle_slot": <int 0..5>, 
   "goal_flag": <bool>,
   "why": "Brief explanation"
@@ -33,9 +39,9 @@ A JSON object only.
 
 **Navigation Rules (Strict Priority):**
 1. **Goal Finding:** If the Target Object is clearly visible in any slot, set `goal_flag=true` and `angle_slot` to its slot.
-2. **Exploration:** If the target is NOT visible, identify slots labeled `[NEW EXPLORATION]`. These are your HIGHEST priority exits. Pick one to enter a new space.
-3. **Oscillation Prevention:** Do NOT go back through a slot labeled `[SOURCE/BACKTRACK]` unless YOU ARE STUCK (all other exits are VISITED or FAILED). Backtracking leads to infinite loops.
-4. **Loop Breaking:** If you see a `[🚨 WARNING: OSCILLATION DETECTED]`, you MUST NOT pick the most recent direction. Force an exploration into a new or different previously explored door.
+2. **Safety:** Avoid slots listed in [DISCOURAGED SLOTS]. These likely cause infinite loops.
+3. **Exploration:** If the target is NOT visible, identify slots labeled `[NEW EXPLORATION]`. These are your HIGHEST priority exits.
+4. **Oscillation Prevention:** Do NOT go back through a slot labeled `[SOURCE/BACKTRACK]` unless YOU ARE STUCK (all other exits are VISITED or FAILED).
 5. **Failures:** AVOID slots labeled `(FAILED xN)` unless they are the only remaining way forward.
 
 **Context:**
@@ -86,9 +92,15 @@ class GPT4V_Planner:
         self,
         pano_images, # Expecting 12 images
         context_text="", # Text from CircularMemory
+        discouraged_slots=[] # list of int
     ):
         # Call LLM
-        vlm_slot, goal_flag, desc, raw_json = self.query_gpt4v(pano_images, context_text)
+        vlm_slot, goal_flag, desc, raw_json = self.query_gpt4v(pano_images, context_text, discouraged_slots)
+        
+        # --- Value Update ---
+        # No strict override anymore. We trust the VLM's judgment but provide strong warnings.
+        
+        # Map VLM's 6-slot index (0..5) back to Original 12-slot index (odd only: 1,3,5...)
         
         # Map VLM's 6-slot index (0..5) back to Original 12-slot index (odd only: 1,3,5...)
         # Reference: concat_panoramic uses indices 1, 3, 5, 7, 9, 11
@@ -165,10 +177,14 @@ class GPT4V_Planner:
         return direction_image, debug_mask, debug_image, vis_rgb, vlm_slot, direction_slot, goal_flag, desc, raw_json
 
 
-    def query_gpt4v(self, pano_images, context_text):
+    def query_gpt4v(self, pano_images, context_text, discouraged_slots=[]):
         # 1. Create Grid Image
         angles = np.arange(len(pano_images)) * (360 // len(pano_images))
         inference_image = cv2.cvtColor(self.concat_panoramic(pano_images, angles), cv2.COLOR_BGR2RGB)
+        
+        # Inject Discouraged Slots into Context if not already there
+        if discouraged_slots:
+             context_text += f"\n\n[DISCOURAGED SLOTS] (AVOID IF POSSIBLE): {discouraged_slots}"
         
         # 2. Prepare Prompt
         prompt = METRIC_FREE_PROMPT.format(context=context_text)

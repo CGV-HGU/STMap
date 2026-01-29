@@ -41,7 +41,7 @@ class Policy_Agent:
         return_goal = cv2.rectangle(return_goal,(int(goal_x)-5,int(goal_y)-5),(int(goal_x)+5,int(goal_y)+5),(255,0,0),-1)
         return_goal = cv2.putText(return_goal,"%d"%int(return_distance[0]*10),(310,50),cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 6, cv2.LINE_AA)
         self.predict_length += 1
-        if early_stop and self.predict_length > 32:
+        if early_stop and self.predict_length > 100:
             return_action = 0
         return return_action, cv2.cvtColor(return_goal,cv2.COLOR_BGR2RGB), float(return_distance[0])
         
