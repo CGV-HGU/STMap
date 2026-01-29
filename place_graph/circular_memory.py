@@ -554,7 +554,10 @@ class CircularMemory:
             lines.append("\n[DECISION HISTORY]")
             for item in list(self.dc_queue)[-3:]:
                 res = item['result'].upper()
-                lines.append(f"- At {item['place_id']}, chose Slot {item['angle_slot']} -> Result: {res}")
+                goal_str = " (Goal Check)" if item.get('goal_flag') else ""
+                lines.append(f"- At {item['place_id']}{goal_str}:")
+                lines.append(f"  Thought: {item['why']}")
+                lines.append(f"  Result: {res}")
 
         # --- Loop Detection ---
         if len(self.dc_queue) >= 3:
