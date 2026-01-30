@@ -29,14 +29,14 @@ content = r"""'''md
 - **Do NOT** use free‑form attributes (size/color/distance/material/etc.), because they vary with pose/lighting and break matching
 
 5) **Door ID + Door Memory is required**
-- To prevent oscillation **before entering a door**, Planner must see door visitation status **in advance**
-- Therefore, **door tokens inside the circular list must carry door state**
-  - Example: `door(id=2, visited=false)` inside the sequence itself
+- To prevent oscillation **before entering a door**, Planner must see exit visitation status **in advance**
+- Therefore, the planner context should render exit state per slot (derived from DoorMemory)
+  - Example: `exit(id=2, visited=false)` in the planner view
 
 6) **Visited=true trigger is explicit**
-- Mark a door **visited=true** only when **scene transition is confirmed**
-  - If we chose a door and, after executing, **SceneType changes** and the change is confirmed (stable), then the chosen door becomes visited
-  - If STOP without scene change: not “visited”, just an attempt/failure record
+- Mark a door **visited=true** only when the **next replanning scan** assigns a **different place_id**
+  - If new place_id != start_place_id: `visited=true`, `last_result=scene_changed`
+  - If still same place: `visited=false`, `last_result=stop_no_change` (attempt recorded)
 
 7) **Single‑episode scope**
 - Place IDs, Door IDs, DCQueue, Circular Storage, DoorMemory 모두 **episode 종료 시 초기화**
@@ -186,7 +186,7 @@ Example per slot:
 A scan produces:
 - `slot_tokens[i]`: token list for slot i
 - `circular_list`: circular representation (defined below)
-- `door_tokens`: doors with IDs and states embedded
+- `exit_annotations`: exit IDs/states for planner display (derived from DoorMemory)
 - `pano_image`: panoramic image for Planner
 
 ### 5.4 Planner output (strict JSON)
@@ -209,14 +209,12 @@ Instead of a single flat list of tokens, store K slots each with tokens:
 
 This makes matching more robust than a single flat sequence.
 
-### 6.2 Door token embedding
-Within each slot’s token list, a door token becomes a structured token:
+### 6.2 Exit state rendering
+Within each slot's token list, the raw token remains `exit`.
+Door IDs are stored separately per slot and expanded for planner display using DoorMemory:
 
-- `door(id=<int>, visited=<bool>, attempts=<int>, last_result=<enum>)`
-
-But to keep Planner input simple:
-- Minimal: `door(id=X, visited=true/false)`
-- Add more fields later.
+- `exit(id=<int>, visited=<bool>)`
+- Optional failure annotation: `exit(id=X, visited=False, FAILED xN)`
 
 ---
 
@@ -233,7 +231,7 @@ We do NOT require perfect match.
 We compute per-slot similarity and sum across slots.
 
 **Per-slot similarity (Jaccard on token sets)**
-- Convert each slot token list to a set (or multiset) excluding door metadata (use just “door” presence for base revisit, or ignore doors entirely for place matching).
+- Convert each slot token list to a set (or multiset) excluding exit metadata (use just "exit" presence for base revisit, or ignore exits entirely for place matching).
 - Jaccard:
   - `sim_slot = |A ∩ B| / |A ∪ B|`
 - Total:
@@ -323,109 +321,81 @@ Prevent oscillation like:
 We must know **at A, before entering**, which door was already used.
 
 ### 8.2 Door identification within a place
-Within a place, doors are identified as tokens in slots.
-We assign a door_id **episode‑locally** as `(place_id, door_id)`.
+Within a place, exits are identified as slots containing the token `exit`
+(door/doorway/etc are normalized to `exit`).
+We track exits episode-locally in DoorMemory using the key `(place_id, door_id)`.
 
-### 8.3 Door matching rule (simple, robust, metric‑free)
-We do NOT rely on degrees/meters.
+Important implementation details (current code):
+- `door_id` is a monotonically increasing integer across the episode (global), not per-place.
+- The canonical slot index is stored separately in `DoorInfo.slot_index`.
+- `door_id` is not the slot index; it is just a unique identifier for lookups/logging.
+
+### 8.3 Door matching rule (current implementation)
+We do NOT rely on meters or visual signature matching.
 We rely on:
 - shift alignment from place match
-- slot neighborhood context around the door
+- canonical slot index for the place
 
-**Door signature** (context window)
-- For a door located at slot `i`, define signature as tokens in window W:
-
-    signature(i) = normalize_tokens(S[i-W .. i+W])  (circular wrap)
-
-Then match doors by signature similarity (Jaccard).
+Algorithm (per scan, after place assignment):
+1) Let `shift` be the matched_shift between the current scan and the canonical scan for this place.
+2) For each slot `j` containing `exit`, compute canonical index:
+   `i = (j - shift) % K`
+3) If DoorMemory already has a door with `place_id == pid` and `slot_index == i`, reuse its `door_id`.
+4) Else allocate a new global `door_id` and store `DoorInfo(slot_index=i)`.
 
 Pseudo:
 
-    def door_signature(S, i, W):
-        tokens = set()
-        for d in range(-W, W+1):
-            tokens |= normalize_tokens(S[(i+d) % K])
-        # ensure 'door' is included to anchor
-        tokens.add('door')
-        return tokens
-
-    def match_or_create_door_id(place_id, S_cur, i_door, door_db, W, T_door):
-        sig = door_signature(S_cur, i_door, W)
-
-        # door_db maps (place_id) -> list of (door_id, signature_proto)
-        candidates = door_db.get(place_id, [])
-
-        best = None  # (score, door_id)
-        for door_id, proto_sig in candidates:
-            score = jaccard(proto_sig, sig)
-            if best is None or score > best[0]:
-                best = (score, door_id)
-
-        if best is not None and best[0] >= T_door:
-            return best[1], sig  # reuse id
-        else:
-            new_door_id = new_door_id_for_place(place_id)
-            candidates.append((new_door_id, sig))
-            door_db[place_id] = candidates
-            return new_door_id, sig
+    def assign_or_reuse_door_id(place_id, slot_j, shift, DoorMemory, next_door_id):
+        i = (slot_j - shift) % K
+        existing = find_door_by_slot_index(DoorMemory, place_id, i)
+        if existing:
+            return existing.door_id, next_door_id
+        new_id = next_door_id
+        DoorMemory[(place_id, new_id)] = DoorInfo(
+            door_id=new_id, place_id=place_id, slot_index=i
+        )
+        return new_id, next_door_id + 1
 
 ### 8.4 Embedding door state into the circular list
-After door_id assignment, augment door tokens in slots:
+After door_id assignment, augment exit tokens in slots:
 
-- `door(id=X, visited=<bool>)`
+- `exit(id=X, visited=<bool>)`
+- Optional failure annotation when `attempts > 0` and `last_result == "stop_no_change"`:
+  `exit(id=X, visited=False, FAILED xN)`
 
 `visited` comes from DoorMemory.
 
-### 8.5 DoorMemory structure (episode‑local)
+### 8.5 DoorMemory structure (episode-local)
 DoorMemory key: `(place_id, door_id)`
 
-Fields (minimum):
+Fields (current code):
+- `door_id: int`
+- `place_id: str`
+- `slot_index: int` (canonical slot index for this place)
 - `visited: bool`
 - `attempts: int`
-- `successes: int` (optional)
-- `fails: int`
-- `last_result: enum {scene_changed, stop_no_change, goal_found, timeout}`
-- `leads_to_place_id: optional` (set after transition)
+- `last_result: enum {none, scene_changed, stop_no_change}`
+- `leads_to_place_id: optional` (set when scene_changed)
 
-### 8.6 “visited=true” update rule (SceneType confirmed)
-This is a must‑have contract.
+### 8.6 “visited=true” update rule (current implementation)
+This is a must-have contract.
 
-We maintain an **ActiveDoorAttempt** when Planner chooses a door:
+We maintain an **ActiveDoorAttempt** when Planner chooses an exit, but we only
+finalize it at the next replanning event (when a new scan has been assigned
+to a place and the outcome is known). The attempts counter is incremented here,
+not at selection time.
 
-ActiveDoorAttempt:
-- start_place_id
-- chosen_door_id
-- start_scene_type
-- status = ACTIVE
+Pseudo (place-based outcome):
 
-During/after EXECUTE:
-- run SceneTypeVLM check
-- confirm scene transition using stability K_confirm
-
-Pseudo:
-
-    def confirm_scene_change(scene_history, K_confirm):
-        # scene_history is recent scene_type labels
-        # change is confirmed if the last K_confirm labels are identical and different from start
-        if len(scene_history) < K_confirm:
-            return False, None
-        last = scene_history[-1]
-        if all(x == last for x in scene_history[-K_confirm:]):
-            return True, last
-        return False, None
-
-    def finalize_door_attempt(active_attempt, scene_history, DoorMemory, current_place_id):
+    def finalize_door_attempt(active_attempt, new_place_id, DoorMemory):
         key = (active_attempt.start_place_id, active_attempt.chosen_door_id)
         DoorMemory[key].attempts += 1
-
-        changed, new_scene = confirm_scene_change(scene_history, K_confirm)
-        if changed and new_scene != active_attempt.start_scene_type:
+        if new_place_id != active_attempt.start_place_id:
             DoorMemory[key].visited = True
             DoorMemory[key].last_result = "scene_changed"
-            DoorMemory[key].leads_to_place_id = current_place_id
+            DoorMemory[key].leads_to_place_id = new_place_id
         else:
             DoorMemory[key].last_result = "stop_no_change"
-            DoorMemory[key].fails += 1
 
 **Interpretation**:
 - A door is “visited” only if we truly crossed into a different scene type stably.
@@ -446,7 +416,7 @@ Store scans in time order:
 
 Each Scan contains:
 - `place_id`
-- `S_slots` (with door tokens and visited flags already embedded)
+- `S_slots` (raw tokens; exit state rendered separately for planner)
 - `best_shift` (alignment hint relative to matched place prototype)
 - `match_score`
 - `planner_decision` (angle_slot, goal_flag)
@@ -485,14 +455,14 @@ Recommended nav context structure:
 1) **System rules**
 - strict output JSON schema
 - do not output metric units
-- prefer unvisited doors unless contradicted by goal cues
+- prefer unvisited exits unless contradicted by goal cues
 
 2) **Goal**
 - target object name (e.g., “bed”)
 
 3) **Current scan circular list**
 - slots 0..K-1, each with tokens
-- doors appear as `door(id=, visited=)`
+- exits appear as `exit(id=, visited=)`
 
 4) **Recent history (last 2–3 scans)**
 - for each: circular list + decision + outcome (short)
@@ -548,8 +518,8 @@ Pseudo:
     def run_episode(env, target_object):
         # ===== episode-local memory reset =====
         place_db = {}        # place_id -> list of representative S_slots
-        door_db  = {}        # place_id -> list of (door_id, proto_signature)
-        DoorMemory = {}      # (place_id, door_id) -> stats
+        DoorMemory = {}      # (place_id, door_id) -> DoorInfo
+        next_door_id = 0
         DCQueue = []         # list of decisions+outcomes
         HistoryScans = []    # last N scans
 
@@ -570,9 +540,9 @@ Pseudo:
                 place_id, shift, match_score, revisit = assign_place(place_db, S_slots, T_revisit)
 
                 # 4) Door ID assignment & embedding visited flags
-                S_slots = embed_doors_with_ids_and_state(
-                    place_id, S_slots, door_db, DoorMemory,
-                    W=door_context_window, T_door=T_door
+                # Uses canonical slot index mapping (matched_shift) + DoorMemory.
+                S_slots, next_door_id = embed_doors_with_ids_and_state(
+                    place_id, S_slots, DoorMemory, next_door_id, shift
                 )
 
                 # 5) Build nav context (include last 2–3 HistoryScans + DCQueue)
