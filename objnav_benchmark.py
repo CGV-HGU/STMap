@@ -23,6 +23,10 @@ from place_graph.circular_memory import CircularMemory, Slot, K_SLOTS
 from llm_utils.tokenizer import extract_tokens_and_description
 from cv_utils.vocab import ALLOWED_VOCAB
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ["MAGNUM_LOG"] = "quiet"
+os.environ["HABITAT_SIM_LOG"] = "quiet"
+
 # Constants
 ACTION_STOP = 0
 ACTION_FORWARD = 1
@@ -58,8 +62,15 @@ def adjust_topdown(metrics):
     return None
 
 def main():
+    print("DEBUG: Entering main function", flush=True)
     args = get_args()
-    habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
+    print(f"DEBUG: Args parsed: {args}", flush=True)
+    try:
+        habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
+        print("DEBUG: Habitat config created", flush=True)
+    except Exception as e:
+        print(f"DEBUG: Error creating config: {e}", flush=True)
+        raise
     
     # Enable NumSteps
     OmegaConf.set_readonly(habitat_config, False)
@@ -84,6 +95,7 @@ def main():
     evaluation_metrics = []
 
     for i in tqdm(range(args.eval_episodes)):
+        print(f"DEBUG: Starting Episode {i}", flush=True)
         obs = habitat_env.reset()
         
         # --- Episode Initialization ---
@@ -351,7 +363,7 @@ def main():
         })
         
         print(f"Episode {i} Summary: SPL={metrics_now['spl']:.2f}, Places={len(memory.places)}")
-        write_metrics(evaluation_metrics)
+        write_metrics(evaluation_metrics, path="objnav_hm3d_stmap.csv")
 
 if __name__ == "__main__":
     main()

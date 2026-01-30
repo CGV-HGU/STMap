@@ -20,9 +20,11 @@ Allowed Vocabulary (for "tokens"):
 
 Rules:
 1. **Tokens**: List common objects using ONLY the allowed vocabulary.
-2. **Landmarks**: List 1-3 UNIQUE visual features that distinguish this specific area (e.g., "red_striped_sofa", "circular_mirror", "tall_blue_vase"). Be specific about colors, materials, or shapes.
-3. **Hierarchy**: If something is a landmark, it can ALSO be in the tokens (e.g., tokens: ["sofa"], landmarks: ["red_striped_sofa"]).
-4. **Description**: Provide a brief one-sentence visual summary highlighting environmental conditions (lighting, clutter).
+2. **Exits (CRITICAL)**: Any path you can walk through (open door, corridor opening, archway) MUST be labeled as "exit".
+3. **Closed Doors (IMPORTANT)**: If a door is CLOSED or blocked, label it as "closed_door". Do NOT label it as "exit".
+4. **Landmarks**: List 1-3 UNIQUE visual features that distinguish this specific area (e.g., "red_striped_sofa", "circular_mirror", "tall_blue_vase"). Be specific about colors, materials, or shapes.
+5. **Hierarchy**: If something is a landmark, it can ALSO be in the tokens (e.g., tokens: ["sofa"], landmarks: ["red_striped_sofa"]).
+6. **Description**: Provide a brief one-sentence visual summary highlighting environmental conditions (lighting, clutter).
 5. Do NOT hallucinate. Only list what is clearly visible.
 
 JSON Format:

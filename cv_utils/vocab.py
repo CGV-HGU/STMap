@@ -24,8 +24,10 @@ TARGET_OBJECTS = {
 }
 
 # 2. Structural Objects (Critical for Navigation / Place Recognition)
+# 2. Structural Objects (Critical for Navigation / Place Recognition)
 STRUCTURAL_OBJECTS = {
-    "door",       # Primary logic token
+    "exit",       # Primary logic token (replaces door)
+    "closed_door", # Visual landmark, but NOT an exit
     "window",
     "stairs",
     "elevator",
@@ -45,15 +47,24 @@ ALLOWED_VOCAB = TARGET_OBJECTS | STRUCTURAL_OBJECTS
 # 4. Normalization Mapping (Raw VLM Output -> Canonical Token)
 # If a word is not here and not in ALLOWED_VOCAB, it will be dropped.
 SYNONYM_MAP = {
-    # Doors
-    "doorway": "door",
-    "entrance": "door",
-    "gate": "door",
-    "sliding door": "door",
-    "archway": "door",
-    "open door": "door",
-    "closed door": "door",
-    "door frame": "door",
+    # Exits (Doors, Archways, Corridors)
+    "door": "exit", # Default to exit if unspecified
+    "doorway": "exit",
+    "entrance": "exit",
+    "gate": "exit",
+    "sliding door": "exit",
+    "archway": "exit",
+    "open door": "exit",
+    
+    # Closed Doors (Obstacles)
+    "closed door": "closed_door",
+    "locked door": "closed_door",
+    
+    "door frame": "exit",
+    "hallway": "exit", # Treat hallway opening as an exit
+    "corridor": "exit", # Treat corridor opening as an exit
+    "opening": "exit",
+    "passage": "exit",
     
     # Furniture
     "couch": "sofa",

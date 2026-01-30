@@ -42,17 +42,17 @@ class Slot:
         """
         items = sorted(list(self.tokens))
         
-        # In the token set, 'door' is just 'door'. 
-        # But for display, we want to augment 'door' with its status if present.
+        # In the token set, 'exit' is just 'exit'. 
+        # But for display, we want to augment 'exit' with its status if present.
         display_items = []
-        has_door_token = "door" in self.tokens
+        has_exit_token = "exit" in self.tokens
         
         for t in items:
-            if t == "door":
-                continue # Handle doors separately
+            if t == "exit":
+                continue # Handle exits separately
             display_items.append(t)
             
-        if has_door_token and self.door_ids:
+        if has_exit_token and self.door_ids:
             for did in self.door_ids:
                 # Look up visited status
                 key = (place_id, did)
@@ -64,12 +64,12 @@ class Slot:
                 last_result = door_memory[key].last_result if key in door_memory else "none"
                 
                 if attempts > 0 and last_result == "stop_no_change":
-                    display_items.append(f"door(id={did}, visited={visited}, FAILED x{attempts})")
+                    display_items.append(f"exit(id={did}, visited={visited}, FAILED x{attempts})")
                 else:
-                    display_items.append(f"door(id={did}, visited={visited})")
-        elif has_door_token:
+                    display_items.append(f"exit(id={did}, visited={visited})")
+        elif has_exit_token:
             # Fallback if no ID assigned yet (shouldn't happen in finalized scan)
-            display_items.append("door(unknown)")
+            display_items.append("exit(unknown)")
             
         return f"[{', '.join(display_items)}]"
 
@@ -239,7 +239,7 @@ class CircularMemory:
         
         # 3. For each current slot j:
         for j, slot in enumerate(slots):
-            if "door" in slot.tokens:
+            if "exit" in slot.tokens:
                 # Calculate canonical index i
                 # ref[i] matches cur[j] where j = (i + shift) % K
                 # => i = (j - shift) % K
@@ -528,10 +528,10 @@ class CircularMemory:
                     door_labels.append(label)
 
             content = slot.to_planner_string(self.door_memory, self.current_place_id)
-            # Remove the generic door format from to_planner_string and use our enhanced labels
+            # Remove the generic exit format from to_planner_string and use our enhanced labels
             if door_labels:
-                # Basic tokens without the generic 'door' tags to avoid clutter
-                base_tokens = [t for t in slot.tokens if t != "door"]
+                # Basic tokens without the generic 'exit' tags to avoid clutter
+                base_tokens = [t for t in slot.tokens if t != "exit"]
                 content = f"[{', '.join(base_tokens + door_labels)}]"
 
             landmark_part = f" (Landmarks: {', '.join(slot.landmarks)})" if slot.landmarks else ""

@@ -15,7 +15,7 @@ def initialize_dino_model(dino_config=GROUNDING_DINO_CONFIG_PATH,
 
 def openset_detection(image,target_classes,dino_model,
                       box_threshold=0.2,
-                      text_threshold=0.35,
+                      text_threshold=0.4,
                       nms_threshold=0.5):
     detections = dino_model.predict_with_classes(image=image,
                                                 classes=target_classes,

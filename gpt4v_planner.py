@@ -41,8 +41,9 @@ A JSON object only.
 1. **Goal Finding:** If the Target Object is clearly visible in any slot, set `goal_flag=true` and `angle_slot` to its slot.
 2. **Safety:** Avoid slots listed in [DISCOURAGED SLOTS]. These likely cause infinite loops.
 3. **Exploration:** If the target is NOT visible, identify slots labeled `[NEW EXPLORATION]`. These are your HIGHEST priority exits.
-4. **Oscillation Prevention:** Do NOT go back through a slot labeled `[SOURCE/BACKTRACK]` unless YOU ARE STUCK (all other exits are VISITED or FAILED).
-5. **Failures:** AVOID slots labeled `(FAILED xN)` unless they are the only remaining way forward.
+4. **Closed Doors (OBSTACLES):** You CANNOT open doors. Treat `closed_door` as a WALL. Do NOT choose it for exploration.
+5. **Oscillation Prevention:** Do NOT go back through a slot labeled `[SOURCE/BACKTRACK]` unless YOU ARE STUCK (all other exits are VISITED or FAILED).
+6. **Failures:** AVOID slots labeled `(FAILED xN)` unless they are the only remaining way forward.
 
 **Context:**
 {context}
