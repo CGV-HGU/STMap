@@ -168,12 +168,14 @@ class CircularMemory:
         best_overall = (None, 0, -1.0) # (pid, shift, score)
         
         for pid, scans in self.places.items():
-            # Match against all representatives (or just the first/last? All is safer for now)
-            for ref_scan in scans:
-                shift, score = self.get_best_shift(ref_scan.slots, current_slots)
-                
-                if score > best_overall[2]:
-                    best_overall = (pid, shift, score)
+            # Match ONLY against the canonical scan (first scan) to keep shifts canonical.
+            if not scans:
+                continue
+            ref_scan = scans[0]
+            shift, score = self.get_best_shift(ref_scan.slots, current_slots)
+            
+            if score > best_overall[2]:
+                best_overall = (pid, shift, score)
         
         pid, shift, score = best_overall
         
@@ -568,4 +570,3 @@ class CircularMemory:
                 lines.append("- STOP this cycle. Choose a [NEW EXPLORATION] slot or a different explored door.")
                 
         return "\n".join(lines), self.get_discouraged_slots()
-
